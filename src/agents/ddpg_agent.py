@@ -138,9 +138,9 @@ class DDPGAgent:
 
         states = torch.FloatTensor(states).to(self.config.DEVICE)
         actions = torch.FloatTensor(actions).to(self.config.DEVICE)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.config.DEVICE)  # Ensure (Batch, 1)
+        rewards = torch.FloatTensor(rewards).view(-1, 1).to(self.config.DEVICE)  # Ensure (Batch, 1)
         next_states = torch.FloatTensor(next_states).to(self.config.DEVICE)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.config.DEVICE)
+        dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
 
         # ----------------------------
         # 1. 更新 Critic

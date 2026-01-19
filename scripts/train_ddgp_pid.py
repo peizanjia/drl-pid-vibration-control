@@ -173,7 +173,8 @@ def train():
             # 或者修改 ReplayBuffer 支持 batch add。这里简单循环即可，CPU 很快。
             for i in range(envs.num_envs):
                 agent.store_transition(states[i], actions[i], rewards[i], next_states[i], dones[i])
-                ep_rewards[i] += rewards[i]
+                r=rewards[i]
+                ep_rewards[i] += rewards[i].item()
 
             # 4. 更新网络
             # 你的要求：每步都更新 Critic 吗？

@@ -15,6 +15,7 @@ class StateSpace:
         self.dt = dt
         self.tn = tn
         self.dx = dx
+        self.Reference = np.zeros(tn)
 
         # PID参数 - 初始值
         self.kp = kp
