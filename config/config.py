@@ -9,8 +9,7 @@ class Config:
     # 环境参数
     DT = 0.01  # 采样时间
     EPISODE_LENGTH = 10000  # 每个episode的长度
-    EPISODES = 500  # 训练episode数量
-    SEGMENT_TN = 100  # 分段训练每段长度
+    EPISODES = 300  # 训练episode数量
 
     # 动力学系统参数
     SYSTEM_CONFIG = config_loader.load_config()
@@ -22,8 +21,8 @@ class Config:
 
     # PID参数范围（归一化前）
     KP_RANGE = [100.0, 200.0]
-    KI_RANGE = [0.0, 1.0]
-    KD_RANGE = [0.0, 1.0]
+    KI_RANGE = [0.0, 100.0]
+    KD_RANGE = [0.0, 100.0]
 
     # 网络参数
     HIDDEN_DIM = 128
@@ -35,7 +34,7 @@ class Config:
     TAU = 0.001
     BUFFER_SIZE = 100000
     BATCH_SIZE = 64
-    WARMUP_STEPS = 1000
+    WARMUP_STEPS = 7500
 
     # 奖励函数权重
     OUTPUT_WEIGHT = 1  # 输出Y的权重

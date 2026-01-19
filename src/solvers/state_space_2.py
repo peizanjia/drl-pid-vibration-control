@@ -1,9 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from config.config import Config
-from config.config_loader import load_mat
-from src.utils.utils import set_seed, create_noise_data
+
 
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 # X'(t) = AX(t) + Bu(t) + F(t)
@@ -33,22 +31,6 @@ class StateSpace:
         self.Xd = np.zeros((4, tn))
         self.Y = np.zeros(tn)
         self.u = 0
-
-        # --- 卡尔曼滤波器初始化 ---
-        self.X_hat = np.zeros((4, tn))
-        self.Xd_hat = np.zeros((4, tn))
-
-        # 估计协方差 P
-        self.P = np.eye(4) * 0.1
-        # 记录 P 的对角线元素 (方差)，用于绘制 3-sigma 包络线
-        # 形状: [4, tn], 对应 4 个状态
-        self.P_diag_history = np.zeros((4, tn))
-
-        # 过程噪声协方差 Q
-        self.Q = np.eye(4) * 1e-5
-
-        # 观测噪声协方差 R
-        self.R_val = 1e-3
 
         # 噪声项
         self.F1 = self.noise_term['F1']
@@ -110,12 +92,6 @@ class StateSpace:
         if self.B.ndim == 1 or self.B.shape != (4, 1):
             self.B = self.B.reshape(4, 1)
 
-        C_mat = self.C.reshape(1, 4)
-        R_mat = np.array([[self.R_val]])
-
-        # 记录初始的 P
-        self.P_diag_history[:, 0] = np.diag(self.P)
-
         # 检查是否设置了外部控制器
         if self.external_controller_callback is None:
             print("警告: 未设置外部控制器，将使用固定PID参数")
@@ -128,7 +104,6 @@ class StateSpace:
 
             # 0. 关键：将当前状态 X[:, i] 转换为 (4, 1) 列向量
             X_col = self.X[:, i].reshape(4, 1)  # 转换为 (4, 1)
-            X_hat_col = self.X_hat[:, i].reshape(4, 1)
 
             # --- 1. 噪声计算与修正 ---
             F1 = self.__compute_noise(i)
@@ -142,9 +117,7 @@ class StateSpace:
 
             # --- 2. 目标 Xd 赋值 ---
             Xd_col = self.A @ X_col + self.B * self.u + F1
-            Xd_hat_col = self.A @ X_hat_col + self.B * self.u + F1
             self.Xd[:, i] = Xd_col.reshape(-1)
-            self.Xd_hat[:, i] = Xd_hat_col.reshape(-1)
 
             # --- 3. PID 计算 ---
             # self.e = -2 * X_col[0] + 2 * X_col[1]
@@ -182,134 +155,96 @@ class StateSpace:
             Y_next = self.C @ X_update_col
             self.Y[i+1] = Y_next.item()
 
-            # 7. 卡尔曼滤波 (Predict & Update)
-            # Predict
-            X_hat_pred = self.Ad @ X_hat_col + self.Bd * self.u
-            P_pred = self.Ad @ self.P @ self.Ad.T + self.Q
-
-            # Update
-            S = C_mat @ P_pred @ C_mat.T + R_mat
-            K = P_pred @ C_mat.T @ np.linalg.inv(S)
-
-            residual = Y_next - (C_mat @ X_hat_pred)
-            X_hat_update = X_hat_pred + K * residual  # 注意这里如果是标量残差，直接乘
-
-            self.P = (np.eye(4) - K @ C_mat) @ P_pred
-
-            self.X_hat[:, i + 1] = X_hat_update.reshape(-1)
-
-            # 记录关键数据：方差
-            self.P_diag_history[:, i + 1] = np.diag(self.P)
-
         # 存储最后一个时间步的PID参数
         self.kp_history[-1] = self.kp
         self.ki_history[-1] = self.ki
         self.kd_history[-1] = self.kd
 
-
-    def plot_voltage_time(self):
+    def plot_time_domain_response(self):
         """
-        绘制电压-时间图像。
-        时间轴的计算规则：时间 = 索引值 * 0.01
+        绘制位移与传感器电压的时间响应曲线。
+        优化了布局逻辑，增强了学术作图的严谨性。
         """
-        # 时间轴
+        # 1. 计算时间轴 (确保 self.dt 已经定义)
         N = self.X.shape[1]
         time_vector = np.arange(N) * self.dt
 
-        # 真实状态组合
+        # 2. 计算合成位移
         z = -2 * self.X[0, :] + 2 * self.X[1, :]
 
-        # 估计状态组合
-        z_hat = -2 * self.X_hat[0, :] + 2 * self.X_hat[1, :]
+        # 3. 创建画布：增加 dpi 提升清晰度，预设学术风格
+        plt.rcParams['font.sans-serif'] = ['SimHei']  # 解决中文显示问题
+        plt.rcParams['axes.unicode_minus'] = False
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-        # 误差
-        z_error = z - z_hat
+        # -------- 子图 1：动力学状态 --------
+        ax1.plot(time_vector, z, color='#1f77b4', linewidth=1.5, label=r'$z = -2X_0 + 2X_1$')
+        ax1.set_ylabel('位移 (m)', fontsize=12)
+        ax1.set_title('端部动力学响应 (真实值)', fontsize=14, fontweight='bold')
+        ax1.legend(loc='upper right')
+        ax1.grid(True, linestyle=':', alpha=0.7)
 
-        plt.figure(figsize=(12, 12))
+        # -------- 子图 2：传感器输出 --------
+        ax2.plot(time_vector, self.Y.flatten(), color='#d62728', linewidth=1.5, label='Sensor Output')
+        ax2.set_xlabel('时间 (s)', fontsize=12)
+        ax2.set_ylabel('电压 (V)', fontsize=12)
+        ax2.set_title('传感器实测电压信号', fontsize=14, fontweight='bold')
+        ax2.legend(loc='upper right')
+        ax2.grid(True, linestyle=':', alpha=0.7)
 
-        # -------- 子图 1：真实状态组合 --------
-        plt.subplot(4, 1, 1)
-        plt.plot(time_vector, z, label=r'$-2X_0 + 2X_1$')
-        plt.ylabel('幅值')
-        plt.title('真实状态组合量')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
+        # 4. 细节微调
+        plt.tight_layout()  # 自动处理子图间距，防止标签重叠
 
-        # -------- 子图 2：估计状态组合 --------
-        plt.subplot(4, 1, 2)
-        plt.plot(time_vector, z_hat, label=r'$-2\hat{X}_0 + 2\hat{X}_1$')
-        plt.ylabel('幅值')
-        plt.title('估计状态组合量')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-
-        # -------- 子图 3：估计误差 --------
-        plt.subplot(4, 1, 3)
-        plt.plot(time_vector, z_error, label=r'$z - \hat{z}$')
-        plt.ylabel('误差')
-        plt.title('状态估计误差')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-
-        # -------- 子图 4：传感器电压 --------
-        plt.subplot(4, 1, 4)
-        plt.plot(time_vector, self.Y, label='传感器电压')
-        plt.xlabel('时间 (s)')
-        plt.ylabel('电压 (V)')
-        plt.title('传感器输出')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-
-        plt.tight_layout()
-        plt.savefig('../../results/state_estimation_separate_subplots.jpg')
-        plt.show()
-
-    def plot_state_estimation(self):
-        N = self.X.shape[1]
-        t = np.arange(N) * self.dt
-
-        plt.figure(figsize=(14, 10))
-
-        for i in range(4):
-            plt.subplot(2, 2, i + 1)
-            plt.plot(t, self.X[i, :], linewidth=0.5, label=rf'$X_{i}$')
-            plt.plot(t, self.X_hat[i, :], '--', linewidth=0.5,
-                     label=rf'$\hat{{X}}_{i}$')
-            plt.title(rf'状态 $X_{i}$ 与估计')
-            plt.grid(True, linestyle='--', alpha=0.5)
-            plt.legend()
-
-        plt.tight_layout()
-        plt.savefig('../../results/state_estimation_all_states.jpg')
-        plt.show()
-
-    def plot_state_derivative_estimation(self):
-        N = self.Xd.shape[1]
-        t = np.arange(N) * self.dt
-
-        plt.figure(figsize=(12, 6))
-
-        for idx, i in enumerate([2, 3]):
-            plt.subplot(2, 1, idx + 1)
-            plt.plot(t, self.Xd[i, :], linewidth=1.1, label=rf'$\dot X_{i}$')
-            plt.plot(t, self.Xd_hat[i, :], '--', linewidth=1.1,
-                     label=rf'$\dot{{\hat X}}_{i}$')
-            plt.title(rf'导数 $\dot X_{i}$ 与估计')
-            plt.grid(True, linestyle='--', alpha=0.5)
-            plt.legend()
-
-        plt.tight_layout()
-        plt.savefig('../../results/state_derivative_estimation.jpg')
+        # 保存时建议使用高质量格式
+        plt.savefig('../../results/state_response.png', dpi=300, bbox_inches='tight')
         plt.show()
 
 
 if __name__ == '__main__':
-    # set_seed(42)
+    from config.config import Config
+    from config.config_loader import load_mat
+    # 1. 基础配置加载
     config = Config()
     tn = config.EPISODE_LENGTH
-    mt = load_mat()
-    # 每次循环调用 create_noise_data，RNG 状态不同，噪声也不同
-    noise_data = create_noise_data(tn, option='mixed', config=config.SYSTEM_CONFIG, mt_data=mt)
-    state_space = StateSpace(config.SYSTEM_CONFIG, noise_data, dt=config.DT, tn=tn, dx=0.005, kp=250, ki=10000, kd=0)
+
+    # 2. 预加载热学数据
+    try:
+        mt = load_mat()
+    except Exception as e:
+        print(f"Warning: mt_data load failed: {e}")
+        mt = None
+
+    # 3. 【核心修正】模拟主进程预计算投影系数
+    from src.utils.utils import BeamDisturbanceProjector, create_noise_data
+
+    proj = BeamDisturbanceProjector()
+    projector_coeffs = proj.get_static_coeffs()
+
+    # 4. 生成噪声数据 (必须传入 projector_data)
+    # 你可以尝试修改 option 为 'impact' 来检查冲击是否出现在前半段
+    noise_data = create_noise_data(
+        tn,
+        option='impact',
+        system_config=config.SYSTEM_CONFIG,
+        mt_data=mt,
+        projector_data=projector_coeffs
+    )
+
+    # 5. 实例化状态空间求解器
+    # 注意：dx 是空间步长，确保它与你的 beam 离散逻辑不冲突
+    state_space = StateSpace(
+        config.SYSTEM_CONFIG,
+        noise_data,
+        dt=config.DT,
+        tn=tn,
+        kp=180,
+        ki=10,
+        kd=20
+    )
+
+    # 6. 求解并绘图
+    print("Solving state space equations...")
     state_space.solve()
-    state_space.plot_voltage_time()
+
+    print("Plotting results...")
+    state_space.plot_time_domain_response()

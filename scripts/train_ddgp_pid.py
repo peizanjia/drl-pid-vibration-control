@@ -1,215 +1,220 @@
 import numpy as np
+import multiprocessing as mp
 import matplotlib.pyplot as plt
 import os
 import time
+from pathlib import Path
+
+# 项目内部导入
 from src.environments.environment_2 import PIDControlEnvironment
 from src.agents.ddpg_agent import DDPGAgent
+from src.solvers.state_space_2 import StateSpace
 from config.config import Config
-from src.utils.utils import set_seed, create_noise_data
+from config.config_loader import load_mat
+from src.utils.utils import BeamDisturbanceProjector, create_noise_data
 
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
+# 设置路径
+ROOT_DIR = Path(__file__).resolve().parent.parent  # 假设 train_parallel 在 scripts 目录下
+MODELS_DIR = ROOT_DIR / "models"
+RESULTS_DIR = ROOT_DIR / "results"
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-def train_ddpg_pid():
-    """训练DDPG自适应PID控制器"""
 
-    # 设置随机种子
-    # set_seed(42)
+def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs):
+    """
+    Worker 进程循环：接收动作 -> 环境步进 -> 发送状态
+    """
+    parent_remote.close()
 
-    # 初始化配置和环境
+    # 局部实例化环境
+    tn = config.EPISODE_LENGTH
+
+    # 辅助函数：重新生成环境（用于 Reset）
+    def make_env():
+        # 调用 utils.py 中修改后的 create_noise_data
+        noise_dict = create_noise_data(
+            tn=tn,
+            dt=config.DT,
+            option=noise_type,
+            system_config=config.SYSTEM_CONFIG,
+            mt_data=mt_data,
+            projector_data=projector_coeffs  # 传入静态系数
+        )
+        ss = StateSpace(config.SYSTEM_CONFIG, noise_dict, dt=config.DT, tn=tn)
+        env = PIDControlEnvironment(config)
+        env.set_state_space(ss)
+        return env
+
+    env = make_env()
+
+    try:
+        while True:
+            cmd, data = remote.recv()
+            if cmd == 'step':
+                action = data
+                next_state, reward, done, info = env.step(action)
+                if done:
+                    # 如果 Done，自动 Reset (Reinforcement Learning 常见做法)
+                    # 重新生成噪声数据以保证下一回合不同
+                    env = make_env()
+                    next_state = env.reset()
+                remote.send((next_state, reward, done, info))
+
+            elif cmd == 'reset':
+                env = make_env()
+                state = env.reset()
+                remote.send(state)
+
+            elif cmd == 'get_history':
+                # 返回用于绘图的数据
+                remote.send((env.state_space.Y, env.state_space.Reference))
+
+            elif cmd == 'close':
+                remote.close()
+                break
+    except Exception as e:
+        print(f"Worker Error ({noise_type}): {e}")
+
+
+class ParallelEnv:
+    def __init__(self, config, num_envs=15):
+        self.config = config
+
+        # 1. 准备数据 (主进程加载一次)
+        print("Loading thermal data...")
+        try:
+            mt_data = load_mat()
+        except:
+            print("Warning: Could not load thermal data. Thermal mode may fail.")
+            mt_data = None
+
+        # 2. 准备 Projector 系数 (主进程计算一次)
+        print("Pre-calculating projector coefficients...")
+        proj = BeamDisturbanceProjector()
+        projector_coeffs = proj.get_static_coeffs()
+
+        # 3. 分配模式 (3*5 = 15 envs)
+        base_modes = ['jitter', 'maneuver', 'impact', 'mixed', 'thermal']
+        self.mode_list = (base_modes * 3)[:num_envs]  # 确保数量匹配
+        self.num_envs = len(self.mode_list)
+
+        print(f"Initializing {self.num_envs} environments with modes: {self.mode_list}")
+
+        # 4. 启动进程
+        self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.num_envs)])
+        self.ps = []
+        for i, (work_remote, remote, mode) in enumerate(zip(self.work_remotes, self.remotes, self.mode_list)):
+            p = mp.Process(target=worker,
+                           args=(work_remote, remote, config, mode, mt_data, projector_coeffs))
+            p.daemon = True
+            p.start()
+            self.ps.append(p)
+            work_remote.close()
+
+    def step(self, actions):
+        for remote, action in zip(self.remotes, actions):
+            remote.send(('step', action))
+        results = [remote.recv() for remote in self.remotes]
+        obs, rews, dones, infos = zip(*results)
+        return np.stack(obs), np.stack(rews), np.stack(dones), infos
+
+    def reset(self):
+        for remote in self.remotes:
+            remote.send(('reset', None))
+        return np.stack([remote.recv() for remote in self.remotes])
+
+    def get_history(self, env_idx):
+        self.remotes[env_idx].send(('get_history', None))
+        return self.remotes[env_idx].recv()
+
+    def close(self):
+        for remote in self.remotes:
+            remote.send(('close', None))
+        for p in self.ps:
+            p.join()
+
+
+def train():
     config = Config()
 
-    # 创建保存目录
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('results', exist_ok=True)
+    # 初始化并行环境 (15个核心)
+    envs = ParallelEnv(config, num_envs=15)
 
-    # 创建噪声数据
-    tn = config.EPISODE_LENGTH
-    noise_data = create_noise_data(tn)
+    # 初始化 Agent (注意传入 num_envs 用于噪声向量化)
+    agent = DDPGAgent(config, num_envs=envs.num_envs)
 
-    # 创建StateSpace实例
-    from src.solvers.state_space_2 import StateSpace
-    state_space = StateSpace(config.SYSTEM_CONFIG, noise_data, dt=config.DT, tn=tn)
-
-    # 创建强化学习环境
-    env = PIDControlEnvironment(config)
-    env.set_state_space(state_space)
-
-    # 创建DDPG智能体
-    agent = DDPGAgent(config)
-
-    # 训练统计
-    episode_rewards = []
-    episode_costs = []
-    critic_losses = []
-    actor_losses = []
-
-    print("开始训练DDPG自适应PID控制器...")
-    print(f"状态维度: {config.STATE_DIM}, 动作维度: {config.ACTION_DIM}")
-    print(f"设备: {config.DEVICE}")
-    print(f"PID参数范围: Kp={config.KP_RANGE}, Ki={config.KI_RANGE}, Kd={config.KD_RANGE}")
-
-    start_time = time.time()
+    print("Start Training Parallel DDPG...")
     total_steps = 0
+    start_time = time.time()
+
+    # 记录器
+    history_rewards = []
 
     for episode in range(config.EPISODES):
-        state = env.reset()
+        states = envs.reset()
         agent.noise.reset()
 
-        episode_reward = 0
-        episode_critic_loss = 0
-        episode_actor_loss = 0
-        update_count = 0
+        ep_rewards = np.zeros(envs.num_envs)
 
         for step in range(config.EPISODE_LENGTH):
-            # 选择动作（归一化的PID参数）
+            # 1. 动作选择 (Batch)
             if total_steps < config.WARMUP_STEPS:
-                # 热身阶段使用随机动作探索
-                action = np.random.uniform(-1, 1, config.ACTION_DIM)
+                actions = np.random.uniform(-1, 1, (envs.num_envs, config.ACTION_DIM))
             else:
-                action = agent.select_action(state)
+                actions = agent.select_action(states)  # Returns (15, action_dim)
 
-            # 与环境交互
-            next_state, reward, done, info = env.step(action)
+            # 2. 环境交互
+            next_states, rewards, dones, infos = envs.step(actions)
 
-            # 存储经验
-            agent.store_transition(state, action, reward, next_state, done)
+            # 3. 存储经验 (Loop storage)
+            # 因为 ReplayBuffer 是线性的，这里我们需要拆开 batch 存进去
+            # 或者修改 ReplayBuffer 支持 batch add。这里简单循环即可，CPU 很快。
+            for i in range(envs.num_envs):
+                agent.store_transition(states[i], actions[i], rewards[i], next_states[i], dones[i])
+                ep_rewards[i] += rewards[i]
 
-            # 更新网络
-            critic_loss, actor_loss = agent.update_networks()
-            if critic_loss is not None:
-                episode_critic_loss += critic_loss
-                episode_actor_loss += actor_loss
-                update_count += 1
+            # 4. 更新网络
+            # 你的要求：每步都更新 Critic 吗？
+            # 建议：如果采集了 15 条数据，可以更新 1 次网络，或者更多。
+            # 这里设置：每一步并行采集完，Update 一次 (Batch Size=128)
+            if len(agent.memory) > config.BATCH_SIZE:
+                agent.update_networks()  # 内部已包含 Actor Delay 逻辑
 
-            state = next_state
-            episode_reward += reward
-            total_steps += 1
+            states = next_states
+            total_steps += envs.num_envs  # 这一步实际上走了 15 个 step
 
-            if done:
-                break
+        # Episode 结束
+        avg_ep_reward = np.mean(ep_rewards)
+        history_rewards.append(avg_ep_reward)
 
-        # 计算平均损失
-        if update_count > 0:
-            avg_critic_loss = episode_critic_loss / update_count
-            avg_actor_loss = episode_actor_loss / update_count
-        else:
-            avg_critic_loss = 0
-            avg_actor_loss = 0
-
-        # 获取性能指标
-        metrics = env.get_performance_metrics()
-
-        episode_rewards.append(episode_reward)
-        episode_costs.append(metrics['total_cost'])
-        critic_losses.append(avg_critic_loss)
-        actor_losses.append(avg_actor_loss)
-
-        # 打印进度
         if episode % 10 == 0:
-            avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else np.mean(episode_rewards)
-            avg_cost = np.mean(episode_costs[-50:]) if len(episode_costs) >= 50 else np.mean(episode_costs)
-            print(f"Episode {episode}, Reward: {episode_reward[0]:.4e}, "
-                  f"Avg Reward: {avg_reward:.4e}, Cost: {metrics['total_cost'][0]:.4e}, "
-                  f"Avg Cost: {avg_cost:.4e}")
+            print(f"Episode {episode} | Avg Reward: {avg_ep_reward:.2f} | Steps: {total_steps}")
+            agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
 
-            # 保存模型
-            agent.save_models(f'models/ddpg_pid_episode_{episode}.pth')
+            # 绘图检查: 随机抽一个 impact 环境 (mode_list index 2, 7, 12 是 impact)
+            try:
+                # 找第一个 impact 环境的索引
+                impact_idx = envs.mode_list.index('impact')
+                Y, Ref = envs.get_history(impact_idx)
+                plt.figure(figsize=(10, 5))
+                plt.plot(Y, label='Response')
+                plt.title(f'Impact Response (Ep {episode})')
+                plt.legend()
+                plt.savefig(RESULTS_DIR / f'resp_ep_{episode}.png')
+                plt.close()
+            except:
+                pass
 
+    print(f"Training Finished. Time: {(time.time() - start_time) / 60:.1f} min")
+    agent.save_models(MODELS_DIR / 'ddpg_final.pth')
+    envs.close()
 
-
-
-
-
-
-
-            #test plot
-            # 1. 准备横坐标数据（索引值）
-            x_indices = np.arange(len(env.state_space.Y))
-
-            # 2. 创建图表
-            plt.figure(figsize=(12, 6))
-
-            # 3. 绘制曲线
-            # 以索引值为横坐标，Y 数组元素为纵坐标
-            plt.plot(x_indices, env.state_space.Y, label='Y 数据值', color='blue', linewidth=1.5)
-
-            # 4. 设置图表属性
-            plt.title('电压时间', fontsize=16)
-            plt.xlabel('时间', fontsize=14)
-            plt.ylabel('电压', fontsize=14)
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.legend()
-
-            # 5. 保存图表
-            plt.savefig(f'results/voltage_plot_ep_{episode}.png')
-            plt.close('all')
+    # 绘制最终曲线
+    plt.plot(history_rewards)
+    plt.savefig(RESULTS_DIR / 'training_curve.png')
 
 
-
-
-
-
-
-
-
-
-
-    # 训练结束
-    training_time = time.time() - start_time
-    print(f"训练完成! 总时间: {training_time:.2f}秒, 总步数: {total_steps}")
-
-    # 保存最终模型
-    agent.save_models('models/ddpg_pid_final.pth')
-
-    # 绘制训练曲线
-    plt.figure(figsize=(15, 10))
-
-    plt.subplot(2, 2, 1)
-    plt.plot(episode_rewards)
-    plt.title('Episode Rewards')
-    plt.xlabel('Episode')
-    plt.ylabel('Total Reward')
-    plt.grid(True)
-
-    plt.subplot(2, 2, 2)
-    plt.plot(episode_costs)
-    plt.title('Episode Costs')
-    plt.xlabel('Episode')
-    plt.ylabel('Total Cost')
-    plt.grid(True)
-
-    plt.subplot(2, 2, 3)
-    plt.plot(critic_losses, label='Critic Loss')
-    plt.plot(actor_losses, label='Actor Loss')
-    plt.title('Training Losses')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-
-    plt.subplot(2, 2, 4)
-    # 计算滑动平均奖励
-    window = 50
-    moving_avg = [np.mean(episode_rewards[i:i + window]) for i in range(len(episode_rewards) - window)]
-    plt.plot(range(window, len(episode_rewards)), moving_avg)
-    plt.title('Moving Average Reward (Window=50)')
-    plt.xlabel('Episode')
-    plt.ylabel('Average Reward')
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.savefig('results/training_curves_pid.png')
-    plt.show()
-
-    # 保存训练数据
-    np.savez('results/training_data_pid.npz',
-             rewards=episode_rewards,
-             costs=episode_costs,
-             critic_losses=critic_losses,
-             actor_losses=actor_losses)
-
-    return agent, env
-
-
-if __name__ == "__main__":
-    train_ddpg_pid()
+if __name__ == '__main__':
+    train()
