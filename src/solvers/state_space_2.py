@@ -236,8 +236,8 @@ if __name__ == '__main__':
         noise_data,
         dt=config.DT,
         tn=tn,
-        kp=180,
-        ki=10,
+        kp=0,
+        ki=0,
         kd=20
     )
 

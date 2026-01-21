@@ -127,45 +127,53 @@ class DDPGAgent:
     def store_transition(self, state, action, reward, next_state, done):
         self.memory.add(state, action, reward, next_state, done)
 
-    def update_networks(self):
+    def update_networks(self, update_actor=True, critic_iters=3):
         """
-        Delayed Policy Update 实现
+        Args:
+            update_actor: 是否更新 Actor (用于延迟更新)
+            critic_iters: Critic 更新次数
         """
         if len(self.memory) < self.config.BATCH_SIZE:
             return None, None
 
-        states, actions, rewards, next_states, dones = self.memory.sample(self.config.BATCH_SIZE)
+        critic_loss_val = 0
 
-        states = torch.FloatTensor(states).to(self.config.DEVICE)
-        actions = torch.FloatTensor(actions).to(self.config.DEVICE)
-        rewards = torch.FloatTensor(rewards).view(-1, 1).to(self.config.DEVICE)  # Ensure (Batch, 1)
-        next_states = torch.FloatTensor(next_states).to(self.config.DEVICE)
-        dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
+        # --- 循环更新 Critic 多次 ---
+        for i in range(critic_iters):
+            states, actions, rewards, next_states, dones = self.memory.sample(self.config.BATCH_SIZE)
 
-        # ----------------------------
-        # 1. 更新 Critic
-        # ----------------------------
-        with torch.no_grad():
-            next_actions = self.actor_target(next_states)
-            # 可以加上 Target Policy Smoothing Noise (TD3 trick)，暂略
-            next_Q_values = self.critic_target(next_states, next_actions)
-            target_Q_values = rewards + (1 - dones) * self.config.GAMMA * next_Q_values
+            states = torch.FloatTensor(states).to(self.config.DEVICE)
+            actions = torch.FloatTensor(actions).to(self.config.DEVICE)
+            rewards = torch.FloatTensor(rewards).view(-1, 1).to(self.config.DEVICE)
+            next_states = torch.FloatTensor(next_states).to(self.config.DEVICE)
+            dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
 
-        current_Q_values = self.critic(states, actions)
-        critic_loss = F.mse_loss(current_Q_values, target_Q_values)
+            # 更新 Critic
+            with torch.no_grad():
+                next_actions = self.actor_target(next_states)
+                # 可以加入 Target Smoothing Noise
+                noise = torch.randn_like(next_actions) * 0.2
+                noise = noise.clamp(-0.5, 0.5)
+                next_actions = (next_actions + noise).clamp(-1.0, 1.0)
 
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_optimizer.step()
+                next_Q_values = self.critic_target(next_states, next_actions)
+                target_Q_values = rewards + (1 - dones) * self.config.GAMMA * next_Q_values
 
+            current_Q_values = self.critic(states, actions)
+            critic_loss = F.mse_loss(current_Q_values, target_Q_values)
+
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # 梯度裁剪很重要
+            self.critic_optimizer.step()
+
+            critic_loss_val += critic_loss.item()
+
+        # --- 延迟更新 Actor (只做一次) ---
         actor_loss_val = None
-
-        # ----------------------------
-        # 2. 延迟更新 Actor
-        # ----------------------------
-        self.update_cnt += 1
-        if self.update_cnt % self.policy_freq == 0:
+        if update_actor:
+            # 重新采样一次或者沿用最后一次的数据都可以，通常重新采样
+            # 为了省事，这里沿用最后一次的 states
             actor_actions = self.actor(states)
             actor_loss = -self.critic(states, actor_actions).mean()
 
@@ -174,13 +182,13 @@ class DDPGAgent:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
 
-            # 软更新目标网络 (通常随 Actor 一起更新)
+            # 软更新
             self.soft_update(self.actor_target, self.actor, self.config.TAU)
             self.soft_update(self.critic_target, self.critic, self.config.TAU)
 
             actor_loss_val = actor_loss.item()
 
-        return critic_loss.item(), actor_loss_val
+        return critic_loss_val / critic_iters, actor_loss_val
 
     def save_models(self, filepath):
         torch.save({
