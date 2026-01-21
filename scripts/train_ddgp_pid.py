@@ -139,69 +139,138 @@ class ParallelEnv:
 def train():
     config = Config()
 
-    # 初始化并行环境 (15个核心)
+    # 1. 初始化
     envs = ParallelEnv(config, num_envs=15)
+    agent = DDPGAgent(config, num_envs=envs.num_envs)  # 你的 DDPG 代码保持不变
 
-    # 初始化 Agent (注意传入 num_envs 用于噪声向量化)
-    agent = DDPGAgent(config, num_envs=envs.num_envs)
-
-    print("Start Training Parallel DDPG...")
+    print("Start Training with Elite Strategy & NaN-Protection...")
     total_steps = 0
     start_time = time.time()
 
     # 记录器
     history_rewards = []
 
+    # --- 核心数据结构：轨迹缓冲区 ---
+    # 结构: lists of (state, action, reward, next_state, done)
+    # 每个环境拥有一个独立的缓存列表
+    trajectory_buffers = [[] for _ in range(envs.num_envs)]
+
+    # 状态追踪器
+    # 记录当前回合每个环境的累计奖励，用于判断是否为"精英"
+    current_ep_rewards = np.zeros(envs.num_envs)
+    # 记录每个环境是否"存活" (没有遇到 NaN)
+    env_active_mask = np.ones(envs.num_envs, dtype=bool)
+
     for episode in range(config.EPISODES):
+        # Reset 之后，得到的 states 是干净的
         states = envs.reset()
         agent.noise.reset()
 
-        ep_rewards = np.zeros(envs.num_envs)
+        # 重置临时缓冲区和追踪器
+        for i in range(envs.num_envs):
+            trajectory_buffers[i] = []
+        current_ep_rewards.fill(0)
+        env_active_mask.fill(True)
+
+        # 统计本回合有多少个环境成功存活并被学习
+        successful_envs_count = 0
 
         for step in range(config.EPISODE_LENGTH):
-            # 1. 动作选择 (Batch)
+            # -------------------------------------------------
+            # 1. 安全的动作选择 (NaN 隔离防火墙)
+            # -------------------------------------------------
+            # 检查 states 是否含有 NaN
+            clean_states = states.copy()
+            nan_indices = np.isnan(states).any(axis=1)
+
+            # 如果发现 NaN，将其替换为 0，防止网络前向传播时崩溃
+            # 注意：这些环境已经被标记为 inactive，它们的输出 action 我们稍后会无视
+            if np.any(nan_indices):
+                clean_states[nan_indices] = 0.0
+                # 这里不更新 mask，因为 mask 由这一步的交互结果决定，
+                # 但如果是上一轮传下来的 NaN，已经在上一轮被 mask 掉了
+
             if total_steps < config.WARMUP_STEPS:
                 actions = np.random.uniform(-1, 1, (envs.num_envs, config.ACTION_DIM))
             else:
-                actions = agent.select_action(states)  # Returns (15, action_dim)
+                # 使用清洗过的 state 进行推理
+                actions = agent.select_action(clean_states)
 
+                # -------------------------------------------------
             # 2. 环境交互
+            # -------------------------------------------------
             next_states, rewards, dones, infos = envs.step(actions)
 
-            # 3. 存储经验 (Loop storage)
-            # 因为 ReplayBuffer 是线性的，这里我们需要拆开 batch 存进去
-            # 或者修改 ReplayBuffer 支持 batch add。这里简单循环即可，CPU 很快。
+            # -------------------------------------------------
+            # 3. 精英策略与 NaN 过滤 (核心逻辑)
+            # -------------------------------------------------
             for i in range(envs.num_envs):
-                agent.store_transition(states[i], actions[i], rewards[i], next_states[i], dones[i])
-                r=rewards[i]
-                ep_rewards[i] += rewards[i].item()
+                # 如果这个环境在之前步骤已经挂了，直接跳过
+                if not env_active_mask[i]:
+                    continue
 
-            # 4. 更新网络
-            # 你的要求：每步都更新 Critic 吗？
-            # 建议：如果采集了 15 条数据，可以更新 1 次网络，或者更多。
-            # 这里设置：每一步并行采集完，Update 一次 (Batch Size=128)
+                # 检查当前步是否产生 NaN (爆炸检测)
+                # 只要 s', r 中有任何一个是 NaN，立刻判死刑
+                if np.isnan(next_states[i]).any() or np.isnan(rewards[i]) or np.isinf(rewards[i]):
+                    env_active_mask[i] = False
+                    trajectory_buffers[i].clear()  # 【整段放弃】：清空之前存的所有步数
+                    # 可选：如果你希望 Agent 知道这里很危险，可以存入最后一步并给巨额惩罚
+                    # 但"精英策略"通常选择直接无视垃圾数据
+                    continue
+
+                # 如果存活，暂存入临时 Buffer
+                # 注意：这里存的是 Python float，用 .item() 避免 numpy 警告
+                r_val = rewards[i].item()
+                trajectory_buffers[i].append(
+                    (states[i], actions[i], r_val, next_states[i], dones[i])
+                )
+                current_ep_rewards[i] += r_val
+
+            # -------------------------------------------------
+            # 4. 网络更新 (解耦)
+            # -------------------------------------------------
+            # 只要 Memory 里有数据就可以更新，不依赖于当前步是否有人爆炸
             if len(agent.memory) > config.BATCH_SIZE:
-                agent.update_networks()  # 内部已包含 Actor Delay 逻辑
+                agent.update_networks()
 
             states = next_states
-            total_steps += envs.num_envs  # 这一步实际上走了 15 个 step
+            total_steps += envs.num_envs
 
-        # Episode 结束
-        avg_ep_reward = np.mean(ep_rewards)
+        # === Episode 结束 ===
+
+        # 5. 将“幸存者”的经验转正 (Flush Buffer)
+        for i in range(envs.num_envs):
+            if env_active_mask[i]:  # 只有全程存活的环境才有资格进入记忆库
+                successful_envs_count += 1
+
+                # 【精英策略扩展】：你可以在这里加更严格的判断
+                # 例如：if current_ep_rewards[i] > -5000: 才存入
+                for transition in trajectory_buffers[i]:
+                    agent.store_transition(*transition)
+
+        # 6. 计算统计数据 (只统计幸存者)
+        if successful_envs_count > 0:
+            # 既然被放弃的环境 buffer 都清空了，rewards 也不能算它们
+            # 这里我们取 active mask 对应的 reward 均值
+            avg_ep_reward = np.mean(current_ep_rewards[env_active_mask])
+        else:
+            avg_ep_reward = -99999.0  # 全军覆没
+
         history_rewards.append(avg_ep_reward)
 
-        if episode % 10 == 0:
-            print(f"Episode {episode} | Avg Reward: {avg_ep_reward:.2f} | Steps: {total_steps}")
-            agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
+        # 7. 打印与保存
+        print(
+            f"Ep {episode:3d} | Valid: {successful_envs_count:2d}/15 | Avg Reward: {avg_ep_reward:8.2f} | Steps: {total_steps}")
 
-            # 绘图检查: 随机抽一个 impact 环境 (mode_list index 2, 7, 12 是 impact)
+        if episode % 10 == 0:
+            agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
+            # ... 绘图代码保持不变 ...
             try:
-                # 找第一个 impact 环境的索引
+                # 绘图逻辑同前
                 impact_idx = envs.mode_list.index('impact')
                 Y, Ref = envs.get_history(impact_idx)
                 plt.figure(figsize=(10, 5))
                 plt.plot(Y, label='Response')
-                plt.title(f'Impact Response (Ep {episode})')
                 plt.legend()
                 plt.savefig(RESULTS_DIR / f'resp_ep_{episode}.png')
                 plt.close()

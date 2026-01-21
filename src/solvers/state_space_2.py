@@ -39,8 +39,6 @@ class StateSpace:
 
         # 系统矩阵
         self.A, self.B, self.C = self.assemble_mat()
-        self.Ad = np.eye(4) + self.A * self.dt
-        self.Bd = self.B * self.dt
 
         # 外部控制器回调函数 - 初始为None，需要在solve前设置
         self.external_controller_callback = None

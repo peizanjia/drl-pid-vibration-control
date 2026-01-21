@@ -24,9 +24,9 @@ class PIDControlEnvironment:
         self.state_space = state_space
 
         # 设置初始PID参数
-        self.state_space.kp = self.config.KP_RANGE[0]
-        self.state_space.ki = self.config.KI_RANGE[0]
-        self.state_space.kd = self.config.KD_RANGE[0]
+        self.state_space.kp = np.ones(self.episode_length) * self.config.KP_RANGE[0]
+        self.state_space.ki = np.ones(self.episode_length) * self.config.KI_RANGE[0]
+        self.state_space.kd = np.ones(self.episode_length) * self.config.KD_RANGE[0]
 
     def reset(self, initial_state=None):
         """重置环境"""
@@ -105,9 +105,9 @@ class PIDControlEnvironment:
         kp, ki, kd = pid_params
 
         # 更新StateSpace的PID参数
-        self.state_space.kp = kp
-        self.state_space.ki = ki
-        self.state_space.kd = kd
+        self.state_space.kp[self.current_step] = kp
+        self.state_space.ki[self.current_step] = ki
+        self.state_space.kd[self.current_step] = kd
 
         # 执行StateSpace的一步计算
         if self.current_step < self.episode_length - 1:

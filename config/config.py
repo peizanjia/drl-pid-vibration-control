@@ -20,9 +20,9 @@ class Config:
     ACTION_DIM = 3  # [kp, ki, kd]
 
     # PID参数范围（归一化前）
-    KP_RANGE = [100.0, 200.0]
-    KI_RANGE = [0.0, 100.0]
-    KD_RANGE = [0.0, 100.0]
+    KP_RANGE = [0.0, 200.0]
+    KI_RANGE = [0.0, 1.0]
+    KD_RANGE = [0.0, 1.0]
 
     # 网络参数
     HIDDEN_DIM = 128
