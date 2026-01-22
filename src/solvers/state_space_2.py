@@ -16,6 +16,7 @@ class StateSpace:
         self.tn = tn
         self.dx = dx
         self.Reference = np.zeros(tn)
+        self.current_step = 0
 
         # PID参数 - 初始值
         self.kp = kp
@@ -78,7 +79,7 @@ class StateSpace:
 
         return A, B, C
 
-    def __compute_noise(self, idx):
+    def compute_noise(self, idx):
         if idx < self.tn:
             F = np.array(
                 [[0], [0], [self.F1[idx, 1]], [self.F2[idx, 1]]])
@@ -96,6 +97,7 @@ class StateSpace:
             print("警告: 未设置外部控制器，将使用固定PID参数")
 
         for i in range(self.tn - 1):
+            self.current_step = i
             # 存储当前PID参数
             self.kp_history[i] = self.kp
             self.ki_history[i] = self.ki
@@ -105,8 +107,8 @@ class StateSpace:
             X_col = self.X[:, i].reshape(4, 1)  # 转换为 (4, 1)
 
             # --- 1. 噪声计算与修正 ---
-            F1 = self.__compute_noise(i)
-            F2 = self.__compute_noise(i + 1)
+            F1 = self.compute_noise(i)
+            F2 = self.compute_noise(i + 1)
 
             # 确保 F1 和 F2 是 (4, 1)
             if F1.ndim == 1 or F1.shape != (4, 1):
@@ -223,7 +225,7 @@ if __name__ == '__main__':
     # 你可以尝试修改 option 为 'impact' 来检查冲击是否出现在前半段
     noise_data = create_noise_data(
         tn,
-        option='impact',
+        option='thermal',
         system_config=config.SYSTEM_CONFIG,
         mt_data=mt,
         projector_data=projector_coeffs
@@ -236,7 +238,7 @@ if __name__ == '__main__':
         noise_data,
         dt=config.DT,
         tn=tn,
-        kp=0,
+        kp=170,
         ki=0,
         kd=20
     )

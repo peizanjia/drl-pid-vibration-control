@@ -21,8 +21,8 @@ class Config:
 
     # PID参数范围（归一化前）
     KP_RANGE = [0.0, 200.0]
-    KI_RANGE = [0.0, 10.0]
-    KD_RANGE = [10.0, 25.0]
+    KI_RANGE = [0.0, 20.0]
+    KD_RANGE = [0.0, 30.0]
 
     # 网络参数
     HIDDEN_DIM = 128
@@ -32,8 +32,8 @@ class Config:
     # 训练参数
     GAMMA = 0.99
     TAU = 0.001
-    BUFFER_SIZE = 100000
-    BATCH_SIZE = 64
+    BUFFER_SIZE = 150000
+    BATCH_SIZE = 1024
     WARMUP_STEPS = 7500
 
     # 奖励函数权重
