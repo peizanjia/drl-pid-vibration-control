@@ -26,8 +26,8 @@ class Config:
 
     # 网络参数
     HIDDEN_DIM = 128
-    ACTOR_LR = 1e-4
-    CRITIC_LR = 1e-3
+    ACTOR_LR = 1e-5
+    CRITIC_LR = 1e-4
 
     # 训练参数
     GAMMA = 0.99

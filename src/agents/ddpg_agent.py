@@ -74,8 +74,8 @@ class DDPGAgent:
         # 向量化噪声
         self.noise = OUNoise(config.ACTION_DIM,
                              num_envs=num_envs,  # 传入环境数量
-                             theta=0.15,
-                             sigma=0.2,
+                             theta=0.3,
+                             sigma=0.02,
                              dt=config.DT)
 
         # 延迟更新计数器
@@ -127,7 +127,7 @@ class DDPGAgent:
     def store_transition(self, state, action, reward, next_state, done):
         self.memory.add(state, action, reward, next_state, done)
 
-    def update_networks(self, update_actor=True, critic_iters=3):
+    def update_networks(self, update_actor=True, critic_iters=1):
         """
         Args:
             update_actor: 是否更新 Actor (用于延迟更新)

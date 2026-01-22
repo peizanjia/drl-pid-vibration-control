@@ -209,7 +209,7 @@ def train():
             # 更新网络：使用延迟更新和多迭代 Critic
             if len(agent.memory) > config.BATCH_SIZE:
                 # 遵循 TD3 思想：Critic 迭代次数多于 Actor
-                agent.update_networks(update_actor=(step % 2 == 0), critic_iters=2)
+                agent.update_networks(update_actor=step%2==0)
 
             states = next_states
 
