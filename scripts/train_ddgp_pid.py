@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import os
 import time
 from pathlib import Path
+import random
+from collections import deque
 
 # 项目内部导入
 from src.environments.environment_2 import PIDControlEnvironment
@@ -21,6 +23,49 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
+
+class PermanentExpertMemory:
+    def __init__(self, capacity=450000, expert_ratio=0.5):
+        self.expert_ratio = expert_ratio
+        # 专家区：存入后不删除
+        self.expert_buffer = []
+        # 智能体区：FIFO 队列
+        self.agent_buffer = deque(maxlen=capacity)
+
+    def add(self, state, action, reward, next_state, done, is_expert=False):
+        """
+        统一接口名为 add，方便直接替换原 ReplayBuffer
+        """
+        transition = (state, action, reward, next_state, done)
+        if is_expert:
+            self.expert_buffer.append(transition)
+        else:
+            self.agent_buffer.append(transition)
+
+    def sample(self, batch_size):
+        # 1. 确定两边采多少
+        n_expert = int(batch_size * self.expert_ratio)
+        n_agent = batch_size - n_expert
+
+        # 2. 安全性检查 (如果 agent 区还没填够 batch)
+        if len(self.agent_buffer) < n_agent:
+            # 此时全部从专家区拿，或者有多少拿多少
+            batch = random.sample(self.expert_buffer, min(batch_size, len(self.expert_buffer)))
+        else:
+            # 正常的 50/50 混合
+            expert_batch = random.sample(self.expert_buffer, n_expert)
+            agent_batch = random.sample(self.agent_buffer, n_agent)
+            batch = expert_batch + agent_batch
+
+        # 3. 【核心修复】将 [(s,a,r,s',d), ...] 转换为 5 个独立的 numpy 数组
+        # 这一步就是为了解决你遇到的 ValueError
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones))
+
+    def __len__(self):
+        return len(self.expert_buffer) + len(self.agent_buffer)
 
 def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs):
     parent_remote.close()
@@ -121,105 +166,91 @@ def train():
     start_time = time.time()
     history_rewards = []
     envs = ParallelEnv(config, num_envs=15)
+
+    # 实例化支持永久区的 Memory
+    # 建议：agent_buffer 的 capacity 设为 config.BUFFER_SIZE * 3 (即 450,000)
     agent = DDPGAgent(config, num_envs=1)
+    agent.memory = PermanentExpertMemory(capacity=450000, expert_ratio=1)
 
-    trajectory_buffers = [[] for _ in range(envs.num_envs)]
-    current_ep_rewards = np.zeros(envs.num_envs)
-    env_active_mask = np.ones(envs.num_envs, dtype=bool)
-    failure_reasons = [""] * envs.num_envs
-
-    # --- [新增] Phase 0: 专家 PID 预热 ---
-    print("\n>>> Phase 0: Expert PID Pre-warming (170, 0, 20)...")
-    expert_pid = np.array([170.0, 0.0, 20.0])
-    # 调用 config 的归一化函数转换成 Actor 空间 [-1, 1] 的动作
+    # --- Phase 0: 专家预热 (逻辑闭环) ---
+    print("\n>>> Phase 0: Expert PID Pre-warming...")
+    expert_pid = np.array([150.0, 5.0, 20.0])
     expert_action_norm = config.normalize_action(expert_pid)
-
     pre_states = envs.reset()
+
     for _ in range(config.EPISODE_LENGTH):
-        # 所有并行环境都执行专家动作
         actions = np.tile(expert_action_norm, (envs.num_envs, 1))
         next_states, rewards, dones, _ = envs.step(actions)
         for i in range(envs.num_envs):
-            # 专家经验也需过滤 NaN 确保质量
             if not np.isnan(next_states[i]).any():
-                agent.store_transition(pre_states[i], actions[i], rewards[i], next_states[i], dones[i])
+                agent.memory.add(pre_states[i], actions[i], rewards[i],
+                                   next_states[i], dones[i], is_expert=True)
         pre_states = next_states
-    print(f">>> Pre-warming finished. Buffer size: {len(agent.memory)}\n")
+    print(f">>> Expert Pool Ready. Size: {len(agent.memory.expert_buffer)}")
 
-    print("Start Formal Training (Robust Mode)...")
-
+    # --- 正式训练 ---
     for episode in range(config.EPISODES):
         states = envs.reset()
         agent.noise.reset()
 
-        for i in range(envs.num_envs): trajectory_buffers[i] = []
-        current_ep_rewards.fill(0)
-        env_active_mask.fill(True)
-        failure_reasons = [""] * envs.num_envs
+        # 每一轮开始前重置统计变量
+        trajectory_buffers = [[] for _ in range(envs.num_envs)]
+        current_ep_rewards = np.zeros(envs.num_envs)
+        env_active_mask = np.ones(envs.num_envs, dtype=bool)
+        failure_reasons = [""] * envs.num_envs  # 确保在这里定义
 
         for step in range(config.EPISODE_LENGTH):
+            # 1. 动作生成
             actions = np.zeros((envs.num_envs, config.ACTION_DIM))
-
             for i in range(envs.num_envs):
                 if env_active_mask[i]:
-                    if np.isnan(states[i]).any():
-                        env_active_mask[i] = False
-                        failure_reasons[i] = "State NaN"
-                        continue
-
-                    # agent 返回的是 [-1, 1] 的归一化动作
                     action = agent.select_action(states[i], add_noise=True)
-
                     if np.isnan(action).any():
                         env_active_mask[i] = False
                         failure_reasons[i] = "Action NaN"
-                        actions[i] = np.zeros(config.ACTION_DIM)
                     else:
                         actions[i] = action
-                else:
-                    actions[i] = np.zeros(config.ACTION_DIM)
 
+            # 2. 环境步进
             next_states, rewards, dones, infos = envs.step(actions)
 
-            # --- [改进] 物理发散与数值审计 ---
+            # 3. 实时审计
             for i in range(envs.num_envs):
                 if not env_active_mask[i]: continue
 
                 r_val = rewards[i].item()
                 abs_y = infos[i].get('abs_y', 0)
 
-                # 判定条件：NaN 或 物理发散 |Y| > 10000
-                is_exploded = np.isnan(next_states[i]).any() or np.isnan(r_val) or abs_y > 10000.0
+                # 发散判定
+                is_diverged = abs_y > 10000.0
+                is_nan = np.isnan(next_states[i]).any()
 
-                if is_exploded:
+                if is_diverged or is_nan:
                     env_active_mask[i] = False
-                    failure_reasons[i] = "Diverged (|Y|>1e4)" if abs_y > 10000.0 else "Numerical NaN"
-
-                    # 存入死亡惩罚 (虽然用户不希望 reward 截断，但发散必须有明确的负反馈)
-                    clean_next_state = np.zeros_like(states[i])
-                    death_penalty = -500.0  # 给予一个显著的负值，不影响正常 reward 范围
-                    trajectory_buffers[i].append(
-                        (states[i], actions[i], death_penalty, clean_next_state, True)
-                    )
+                    failure_reasons[i] = "Diverged" if is_diverged else "NextState NaN"
+                    # 存入一笔带有死亡惩罚的终止经验
+                    trajectory_buffers[i].append((states[i], actions[i], -500.0, np.zeros_like(states[i]), True))
                     continue
 
+                # 正常经验暂存
                 trajectory_buffers[i].append((states[i], actions[i], r_val, next_states[i], dones[i]))
                 current_ep_rewards[i] += r_val
 
-            # 更新网络：使用延迟更新和多迭代 Critic
-            if len(agent.memory) > config.BATCH_SIZE:
-                # 遵循 TD3 思想：Critic 迭代次数多于 Actor
-                agent.update_networks(update_actor=step%2==0)
+            # 4. 网络更新
+            if len(agent.memory.agent_buffer) > config.BATCH_SIZE:
+                agent.update_networks(update_actor=step % 2 == 0)
 
             states = next_states
 
-        # === Episode 结束：数据存入与统计 ===
+        # === Episode 结束：结算数据并打印失败原因 ===
         valid_count = 0
         for i in range(envs.num_envs):
-            if len(trajectory_buffers[i]) > 0:
+            # 将暂存的轨迹刷入 agent_buffer (is_expert=False)
+            if trajectory_buffers[i]:
                 for t in trajectory_buffers[i]:
-                    agent.store_transition(*t)
-            if env_active_mask[i]: valid_count += 1
+                    agent.memory.add(*t, is_expert=False)
+            if env_active_mask[i]:
+                valid_count += 1
 
         failed_modes = [f"{envs.mode_list[i]}({failure_reasons[i]})" for i in range(envs.num_envs) if
                         not env_active_mask[i]]

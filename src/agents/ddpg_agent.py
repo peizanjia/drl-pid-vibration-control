@@ -53,6 +53,50 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class PermanentExpertMemory:
+    def __init__(self, capacity=450000, expert_ratio=0.5):
+        self.expert_ratio = expert_ratio
+        # 专家区：存入后不删除
+        self.expert_buffer = []
+        # 智能体区：FIFO 队列
+        self.agent_buffer = deque(maxlen=capacity)
+
+    def add(self, state, action, reward, next_state, done, is_expert=False):
+        """
+        统一接口名为 add，方便直接替换原 ReplayBuffer
+        """
+        transition = (state, action, reward, next_state, done)
+        if is_expert:
+            self.expert_buffer.append(transition)
+        else:
+            self.agent_buffer.append(transition)
+
+    def sample(self, batch_size):
+        # 1. 确定两边采多少
+        n_expert = int(batch_size * self.expert_ratio)
+        n_agent = batch_size - n_expert
+
+        # 2. 安全性检查 (如果 agent 区还没填够 batch)
+        if len(self.agent_buffer) < n_agent:
+            # 此时全部从专家区拿，或者有多少拿多少
+            batch = random.sample(self.expert_buffer, min(batch_size, len(self.expert_buffer)))
+        else:
+            # 正常的 50/50 混合
+            expert_batch = random.sample(self.expert_buffer, n_expert)
+            agent_batch = random.sample(self.agent_buffer, n_agent)
+            batch = expert_batch + agent_batch
+
+        # 3. 【核心修复】将 [(s,a,r,s',d), ...] 转换为 5 个独立的 numpy 数组
+        # 这一步就是为了解决你遇到的 ValueError
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones))
+
+    def __len__(self):
+        return len(self.expert_buffer) + len(self.agent_buffer)
+
+
 class DDPGAgent:
     def __init__(self, config, num_envs=1):  # 增加 num_envs 参数
         self.config = config
@@ -69,7 +113,7 @@ class DDPGAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.ACTOR_LR)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=config.CRITIC_LR)
 
-        self.memory = ReplayBuffer(config.BUFFER_SIZE)
+        self.memory = PermanentExpertMemory(capacity=config.BUFFER_SIZE * 3, expert_ratio=0.5)
 
         # 向量化噪声
         self.noise = OUNoise(config.ACTION_DIM,
@@ -124,8 +168,9 @@ class DDPGAgent:
             return action.flatten()
         return action
 
-    def store_transition(self, state, action, reward, next_state, done):
-        self.memory.add(state, action, reward, next_state, done)
+    def store_transition(self, state, action, reward, next_state, done, is_expert=False):
+        # 增加 is_expert 参数向下传递
+        self.memory.add(state, action, reward, next_state, done, is_expert=is_expert)
 
     def update_networks(self, update_actor=True, critic_iters=1):
         """
