@@ -56,15 +56,10 @@ class ReplayBuffer:
 class PermanentExpertMemory:
     def __init__(self, capacity=450000, expert_ratio=0.5):
         self.expert_ratio = expert_ratio
-        # 专家区：存入后不删除
-        self.expert_buffer = []
-        # 智能体区：FIFO 队列
-        self.agent_buffer = deque(maxlen=capacity)
+        self.expert_buffer = []  # 列表：专家数据，只增不减
+        self.agent_buffer = deque(maxlen=capacity)  # 队列：RL数据
 
     def add(self, state, action, reward, next_state, done, is_expert=False):
-        """
-        统一接口名为 add，方便直接替换原 ReplayBuffer
-        """
         transition = (state, action, reward, next_state, done)
         if is_expert:
             self.expert_buffer.append(transition)
@@ -72,24 +67,26 @@ class PermanentExpertMemory:
             self.agent_buffer.append(transition)
 
     def sample(self, batch_size):
-        # 1. 确定两边采多少
+        # 1. 计算配额
         n_expert = int(batch_size * self.expert_ratio)
         n_agent = batch_size - n_expert
 
-        # 2. 安全性检查 (如果 agent 区还没填够 batch)
-        if len(self.agent_buffer) < n_agent:
-            # 此时全部从专家区拿，或者有多少拿多少
-            batch = random.sample(self.expert_buffer, min(batch_size, len(self.expert_buffer)))
+        # 2. 边界检查：如果强制全专家 (ratio=1.0) 或 agent 池不够
+        if n_agent == 0 or len(self.agent_buffer) < n_agent:
+            # 全从专家池采
+            batch = random.sample(self.expert_buffer, batch_size)
+        elif len(self.expert_buffer) < n_expert:
+            # 理论上 Phase 0 后不会发生，防万一：全从 Agent 池采
+            batch = random.sample(self.agent_buffer, batch_size)
         else:
-            # 正常的 50/50 混合
+            # 混合采样
             expert_batch = random.sample(self.expert_buffer, n_expert)
             agent_batch = random.sample(self.agent_buffer, n_agent)
             batch = expert_batch + agent_batch
 
-        # 3. 【核心修复】将 [(s,a,r,s',d), ...] 转换为 5 个独立的 numpy 数组
-        # 这一步就是为了解决你遇到的 ValueError
         states, actions, rewards, next_states, dones = zip(*batch)
 
+        # 确保数据类型正确
         return (np.array(states), np.array(actions), np.array(rewards),
                 np.array(next_states), np.array(dones))
 
@@ -125,6 +122,63 @@ class DDPGAgent:
         # 延迟更新计数器
         self.update_cnt = 0
         self.policy_freq = 2  # 甚至 Critic 更新 2 次，Actor 更新 1 次
+
+    # ---------------------------------------------------------
+    # 针对 Phase 1: 纯 Actor 模仿学习 (Behavior Cloning)
+    # ---------------------------------------------------------
+    def update_actor_supervised(self, batch_size=256):
+        if len(self.memory.expert_buffer) < batch_size:
+            return 0.0
+
+        # 强制从专家区采样
+        states, actions, _, _, _ = self.memory.sample(batch_size)
+
+        states = torch.FloatTensor(states).to(self.config.DEVICE)
+        expert_actions = torch.FloatTensor(actions).to(self.config.DEVICE)
+
+        predicted_actions = self.actor(states)
+        loss = F.mse_loss(predicted_actions, expert_actions)
+
+        self.actor_optimizer.zero_grad()
+        loss.backward()
+        # 即使是监督学习，也建议加梯度裁剪
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        self.actor_optimizer.step()
+        return loss.item()
+
+    # ---------------------------------------------------------
+    # 针对 Phase 2: 纯 Critic 预热 (学习专家的价值函数)
+    # ---------------------------------------------------------
+    def pretrain_critic(self, batch_size=256):
+        if len(self.memory.expert_buffer) < batch_size:
+            return 0.0
+
+        # 采样专家轨迹
+        states, actions, rewards, next_states, dones = self.memory.sample(batch_size)
+
+        states = torch.FloatTensor(states).to(self.config.DEVICE)
+        actions = torch.FloatTensor(actions).to(self.config.DEVICE)
+        rewards = torch.FloatTensor(rewards).view(-1, 1).to(self.config.DEVICE)
+        next_states = torch.FloatTensor(next_states).to(self.config.DEVICE)
+        dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
+
+        with torch.no_grad():
+            # 这里用目标 Actor(已通过BC更新) 来计算下一步动作
+            next_actions = self.actor_target(next_states)
+            next_Q = self.critic_target(next_states, next_actions)
+            target_Q = rewards + (1 - dones) * self.config.GAMMA * next_Q
+
+        current_Q = self.critic(states, actions)
+        loss = F.mse_loss(current_Q, target_Q)
+
+        self.critic_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optimizer.step()
+
+        # 软更新 Critic Target
+        self.soft_update(self.critic_target, self.critic, self.config.TAU)
+        return loss.item()
 
     def hard_update(self, target, source):
         for target_param, param in zip(target.parameters(), source.parameters()):

@@ -5,7 +5,6 @@ import os
 import time
 from pathlib import Path
 import random
-from collections import deque
 
 # 项目内部导入
 from src.environments.environment_2 import PIDControlEnvironment
@@ -23,49 +22,6 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-
-class PermanentExpertMemory:
-    def __init__(self, capacity=450000, expert_ratio=0.5):
-        self.expert_ratio = expert_ratio
-        # 专家区：存入后不删除
-        self.expert_buffer = []
-        # 智能体区：FIFO 队列
-        self.agent_buffer = deque(maxlen=capacity)
-
-    def add(self, state, action, reward, next_state, done, is_expert=False):
-        """
-        统一接口名为 add，方便直接替换原 ReplayBuffer
-        """
-        transition = (state, action, reward, next_state, done)
-        if is_expert:
-            self.expert_buffer.append(transition)
-        else:
-            self.agent_buffer.append(transition)
-
-    def sample(self, batch_size):
-        # 1. 确定两边采多少
-        n_expert = int(batch_size * self.expert_ratio)
-        n_agent = batch_size - n_expert
-
-        # 2. 安全性检查 (如果 agent 区还没填够 batch)
-        if len(self.agent_buffer) < n_agent:
-            # 此时全部从专家区拿，或者有多少拿多少
-            batch = random.sample(self.expert_buffer, min(batch_size, len(self.expert_buffer)))
-        else:
-            # 正常的 50/50 混合
-            expert_batch = random.sample(self.expert_buffer, n_expert)
-            agent_batch = random.sample(self.agent_buffer, n_agent)
-            batch = expert_batch + agent_batch
-
-        # 3. 【核心修复】将 [(s,a,r,s',d), ...] 转换为 5 个独立的 numpy 数组
-        # 这一步就是为了解决你遇到的 ValueError
-        states, actions, rewards, next_states, dones = zip(*batch)
-
-        return (np.array(states), np.array(actions), np.array(rewards),
-                np.array(next_states), np.array(dones))
-
-    def __len__(self):
-        return len(self.expert_buffer) + len(self.agent_buffer)
 
 def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs):
     parent_remote.close()
@@ -165,28 +121,94 @@ def train():
     config = Config()
     start_time = time.time()
     history_rewards = []
+
+    # 1. 环境初始化
     envs = ParallelEnv(config, num_envs=15)
 
-    # 实例化支持永久区的 Memory
-    # 建议：agent_buffer 的 capacity 设为 config.BUFFER_SIZE * 3 (即 450,000)
+    # 2. Agent 初始化
+    # 关键修改：capacity 设大一点给 agent_buffer 用，expert_ratio 初始为 1.0 (全专家)
     agent = DDPGAgent(config, num_envs=1)
-    agent.memory = PermanentExpertMemory(capacity=450000, expert_ratio=1)
+    # 我们希望专家数据至少有 150,000 条，这个列表会自动增长，不用担心 capacity
+    # capacity 主要是限制 agent_buffer (RL 探索数据) 的大小
+    agent.memory.expert_ratio = 1.0
 
-    # --- Phase 0: 专家预热 (逻辑闭环) ---
-    print("\n>>> Phase 0: Expert PID Pre-warming...")
-    expert_pid = np.array([150.0, 5.0, 20.0])
+    # =========================================================================
+    # PHASE 0: 鲁棒的专家数据采集 (Robust Data Collection)
+    # =========================================================================
+    TARGET_EXPERT_SAMPLES = 750000  # 目标：采集高质量专家数据
+    print(f"\n>>> Phase 0: Robust Data Collection (Target: {TARGET_EXPERT_SAMPLES})...")
+
+    expert_pid = np.array([100.0, 5.0, 25.0])
     expert_action_norm = config.normalize_action(expert_pid)
-    pre_states = envs.reset()
 
-    for _ in range(config.EPISODE_LENGTH):
-        actions = np.tile(expert_action_norm, (envs.num_envs, 1))
-        next_states, rewards, dones, _ = envs.step(actions)
-        for i in range(envs.num_envs):
-            if not np.isnan(next_states[i]).any():
-                agent.memory.add(pre_states[i], actions[i], rewards[i],
-                                   next_states[i], dones[i], is_expert=True)
-        pre_states = next_states
-    print(f">>> Expert Pool Ready. Size: {len(agent.memory.expert_buffer)}")
+    current_samples = 0
+    round_idx = 0
+
+    # 循环采集，直到存够数据
+    while current_samples < TARGET_EXPERT_SAMPLES:
+        # 每次循环都生成新的随机种子
+        seeds = [random.randint(0, 100000) for _ in range(envs.num_envs)]
+        pre_states = envs.reset(seeds=seeds)
+
+        # 每轮只跑 1000-2000 步，然后就重置。
+        # 这样可以让池子里充斥着大量的“初始震荡抑制”和“随机冲击恢复”的数据
+        # 而不仅仅是平稳运行的数据。
+        steps_per_round = 7500
+
+        for _ in range(steps_per_round):
+            actions = np.tile(expert_action_norm, (envs.num_envs, 1))
+            next_states, rewards, dones, _ = envs.step(actions)
+
+            for i in range(envs.num_envs):
+                # 过滤 NaN，只存有效数据
+                if not np.isnan(next_states[i]).any():
+                    agent.memory.add(pre_states[i], actions[i], rewards[i],
+                                     next_states[i], dones[i], is_expert=True)
+                    current_samples += 1
+
+            pre_states = next_states
+
+            if current_samples >= TARGET_EXPERT_SAMPLES:
+                break
+
+        round_idx += 1
+        print(f"  > Collection Round {round_idx}: Total Samples {current_samples}/{TARGET_EXPERT_SAMPLES}")
+
+    print(f">>> Expert Pool Ready. Total Rounds: {round_idx}, Size: {len(agent.memory.expert_buffer)}")
+
+    # =========================================================================
+    # PHASE 1: Actor 监督学习 (让飞行员学会开飞机)
+    # =========================================================================
+    print("\n>>> Phase 1: Actor Behavior Cloning...")
+    agent.memory.expert_ratio = 1.0
+    for i in range(5000):
+        loss = agent.update_actor_supervised(batch_size=256)
+        if i % 1000 == 0:
+            print(f"  [BC] Iter {i} | Actor Loss: {loss:.6f}")
+
+    # 关键：BC 结束后立即硬同步 Actor Target
+    agent.hard_update(agent.actor_target, agent.actor)
+
+    # =========================================================================
+    # PHASE 2: Critic 价值预热 (让指挥部学会评分)
+    # =========================================================================
+    print("\n>>> Phase 2: Critic Value Warm-up...")
+    # 依然只使用专家数据，但这次是练 Critic
+    for i in range(20000):
+        c_loss = agent.pretrain_critic(batch_size=256)
+        if i % 1000 == 0:
+            print(f"  [Warmup] Iter {i} | Critic Loss: {c_loss:.6f}")
+
+    # 再次硬同步所有网络，确保正式开跑前 Target = Local
+    agent.hard_update(agent.actor_target, agent.actor)
+    agent.hard_update(agent.critic_target, agent.critic)
+    print(">>> All Networks Pre-trained and Synced.")
+
+    # =========================================================================
+    # PHASE 3: 进入 RL 训练
+    # =========================================================================
+    print("\n>>> Phase 2: Start RL Fine-tuning...")
+    agent.memory.expert_ratio = 0.5  # 恢复混合采样
 
     # --- 正式训练 ---
     for episode in range(config.EPISODES):
@@ -264,31 +286,30 @@ def train():
         print(f"Ep {episode:3d} | Valid: {valid_count:2d}/15 | AvgR: {avg_reward:7.1f} | Fail: {failed_modes[:2]}...")
 
         # --- 绘图功能保留 ---
-        if episode % 10 == 0:
-            agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
-            target_modes = ['impact', 'mixed']
-            for target_mode in target_modes:
-                try:
-                    if target_mode in envs.mode_list:
-                        idx = envs.mode_list.index(target_mode)
-                        Y, Ref, Kp, Ki, Kd = envs.get_history(idx)
-                        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-                        axes[0].plot(Ref, 'k--', label='Ref', alpha=0.5)
-                        axes[0].plot(Y, 'b', label='Response')
-                        axes[0].set_title(f'Ep {episode} - {target_mode} Response (R={current_ep_rewards[idx]:.1f})')
-                        axes[0].legend()
-                        axes[0].grid(True)
-                        axes[1].plot(Kp, label='Kp')
-                        axes[1].plot(Ki, label='Ki')
-                        axes[1].plot(Kd, label='Kd')
-                        axes[1].set_title('PID Gains Evolution')
-                        axes[1].legend()
-                        axes[1].grid(True)
-                        plt.tight_layout()
-                        plt.savefig(RESULTS_DIR / f'resp_{target_mode}_ep_{episode}.png')
-                        plt.close()
-                except Exception as e:
-                    print(f"Plotting failed: {e}")
+        agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
+        target_modes = ['impact', 'mixed']
+        for target_mode in target_modes:
+            try:
+                if target_mode in envs.mode_list:
+                    idx = envs.mode_list.index(target_mode)
+                    Y, Ref, Kp, Ki, Kd = envs.get_history(idx)
+                    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+                    axes[0].plot(Ref, 'k--', label='Ref', alpha=0.5)
+                    axes[0].plot(Y, 'b', label='Response')
+                    axes[0].set_title(f'Ep {episode} - {target_mode} Response (R={current_ep_rewards[idx]:.1f})')
+                    axes[0].legend()
+                    axes[0].grid(True)
+                    axes[1].plot(Kp, label='Kp')
+                    axes[1].plot(Ki, label='Ki')
+                    axes[1].plot(Kd, label='Kd')
+                    axes[1].set_title('PID Gains Evolution')
+                    axes[1].legend()
+                    axes[1].grid(True)
+                    plt.tight_layout()
+                    plt.savefig(RESULTS_DIR / f'resp_{target_mode}_ep_{episode}.png')
+                    plt.close()
+            except Exception as e:
+                print(f"Plotting failed: {e}")
 
     # === 训练结束绘图保留 ===
     print(f"Training Finished. Total Time: {(time.time() - start_time) / 60:.1f} min")

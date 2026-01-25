@@ -225,7 +225,7 @@ if __name__ == '__main__':
     # 你可以尝试修改 option 为 'impact' 来检查冲击是否出现在前半段
     noise_data = create_noise_data(
         tn,
-        option='thermal',
+        option='impact',
         system_config=config.SYSTEM_CONFIG,
         mt_data=mt,
         projector_data=projector_coeffs
@@ -238,9 +238,9 @@ if __name__ == '__main__':
         noise_data,
         dt=config.DT,
         tn=tn,
-        kp=170,
-        ki=0,
-        kd=20
+        kp=100,
+        ki=5,
+        kd=25
     )
 
     # 6. 求解并绘图
