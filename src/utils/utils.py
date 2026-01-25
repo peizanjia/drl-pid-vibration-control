@@ -134,7 +134,7 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
 
     # -> Maneuver
     if option in ['maneuver', 'mixed']:
-        t_start = np.random.uniform(0.1, 0.4) * tn * dt
+        t_start = np.random.uniform(0.1, 0.2) * tn * dt
         duration = np.random.uniform(1.5, 3.5)
         max_alpha = np.random.uniform(0.05, 0.15)
 
@@ -148,8 +148,7 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
 
     # -> Impact (物理修正：强制发生在前半段)
     if option == 'impact':
-        # 强制冲击发生在 5% 到 60% 之间
-        t_imp_start = np.random.uniform(0.05, 0.60) * tn * dt
+        t_imp_start = np.random.uniform(0.05, 0.10) * tn * dt
         x_loc = np.random.uniform(1.0, 4.8)
         f_peak = np.random.uniform(80, 200)  # 增大一点力度
         dt_imp = 0.1

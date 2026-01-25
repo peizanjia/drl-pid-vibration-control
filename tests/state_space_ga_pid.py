@@ -1,158 +1,60 @@
 import numpy as np
 import copy
 import os
+import sys
 import multiprocessing
 from functools import partial
-from config.config import Config
-from src.utils.utils import create_noise_data
 
+# ==========================================
+# 1. 环境与路径补丁
+# ==========================================
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
-# ==========================================
-# 1. 全局配置与辅助
-# ==========================================
-tn_sim = 10000
-dt_sim = 0.01
+# 自动定位项目根目录
+current_file = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(current_file))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from config.config import Config
+from src.utils.utils import create_noise_data, BeamDisturbanceProjector
+from src.solvers.state_space_2 import StateSpace  # 确保你的 StateSpace 类支持 solve() 方法
 
 
 # ==========================================
-# 2. StateSpace 类 (保持不变)
+# 2. 独立的并行评估函数 (必须在类外)
 # ==========================================
-class StateSpace:
-    def __init__(self, config, noise_term, dt=0.01, tn=1000, dx=0.005, kp=0.0, ki=0.0, kd=0.0):
-        # 这里的 config 预期是一个字典
-        self.config = config
-        self.noise_term = noise_term
-        self.dt = dt
-        self.tn = tn
-        self.dx = dx
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-
-        self.e = 0
-        self.ei = 0
-        self.ed = 0
-
-        self.X = np.zeros((4, tn))
-        self.Xd = np.zeros((4, tn))
-        self.Y = np.zeros(tn)
-        self.u = 0
-
-        self.F1 = noise_term['F1']
-        self.F2 = noise_term['F2']
-
-        self.A, self.B, self.C = self.assemble_mat()
-        self.external_controller_callback = None
-
-        self.kp_history = np.zeros(tn)
-        self.ki_history = np.zeros(tn)
-        self.kd_history = np.zeros(tn)
-
-    def set_external_controller(self, controller_callback):
-        self.external_controller_callback = controller_callback
-
-    def assemble_mat(self):
-        # 确保这里通过字典键值访问
-        w1, w2 = self.config['w1'], self.config['w2']
-        z1, z2 = self.config['z1'], self.config['z2']
-        B1, B2 = self.config['B1'], self.config['B2']
-        C1, C2 = self.config['C1'], self.config['C2']
-
-        A = np.array([[0, 0, 1, 0],
-                      [0, 0, 0, 1],
-                      [-w1 ** 2, 0, -2 * z1 * w1, 0],
-                      [0, -w2 ** 2, 0, -2 * z2 * w2]])
-        B = np.array([[0], [0], [B1], [B2]])
-        C = np.array([C1, C2, 0, 0])
-        return A, B, C
-
-    def __compute_noise(self, idx):
-        if idx < self.tn:
-            val1 = self.F1[idx, 1] if idx < len(self.F1) else 0
-            val2 = self.F2[idx, 1] if idx < len(self.F2) else 0
-            F = np.array([[0], [0], [val1], [val2]])
-        else:
-            F = np.zeros((4, 1))
-        return F
-
-    def solve(self):
-        if self.B.ndim == 1 or self.B.shape != (4, 1):
-            self.B = self.B.reshape(4, 1)
-
-        for i in range(self.tn - 1):
-            self.kp_history[i] = self.kp
-            self.ki_history[i] = self.ki
-            self.kd_history[i] = self.kd
-
-            X_col = self.X[:, i].reshape(4, 1)
-            F1 = self.__compute_noise(i)
-            F2 = self.__compute_noise(i + 1)
-
-            if F1.ndim == 1: F1 = F1.reshape(4, 1)
-            if F2.ndim == 1: F2 = F2.reshape(4, 1)
-
-            Xd_col = self.A @ X_col + self.B * self.u + F1
-            self.Xd[:, i] = Xd_col.reshape(-1)
-
-            self.e = (self.C @ X_col).item()
-            self.ei += (self.e * self.dt)
-            self.ed = (self.C @ Xd_col).item()
-
-            self.u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed
-
-            if self.external_controller_callback is not None:
-                new_kp, new_ki, new_kd = self.external_controller_callback(self.Y[i], i * self.dt)
-                self.kp, self.ki, self.kd = new_kp, new_ki, new_kd
-
-            k1_col = self.dt * Xd_col
-            k2_col = self.dt * (self.A @ (X_col + k1_col / 2) + self.B * self.u + (F1 + F2) / 2)
-            k3_col = self.dt * (self.A @ (X_col + k2_col / 2) + self.B * self.u + (F1 + F2) / 2)
-            k4_col = self.dt * (self.A @ (X_col + k3_col) + self.B * self.u + F2)
-
-            X_update_col = X_col + (k1_col + 2 * k2_col + 2 * k3_col + k4_col) / 6.0
-
-            if np.any(np.abs(X_update_col) > 1e10):
-                self.X[:, i + 1:] = np.nan
-                self.Y[i + 1:] = np.nan
-                break
-
-            self.X[:, i + 1] = X_update_col.reshape(-1)
-            self.Y[i + 1] = (self.C @ X_update_col).item()
-
-        self.kp_history[-1] = self.kp
-        self.ki_history[-1] = self.ki
-        self.kd_history[-1] = self.kd
-
-
-# ==========================================
-# 3. 独立的并行工作函数 (必须定义在类外面)
-# ==========================================
-def evaluate_individual_robust(params, config_dict, projector_data, w_y, w_yd, dt_val, tn_val):
+def evaluate_individual_robust(params, config_dict, projector_data, thermal_vector, dt_val, tn_val):
     """
-    鲁棒性评估：在 5 种不同的扰动环境下评估同一组 PID 参数
+    在 5 种工况下评估同一组 PID 参数的鲁棒性
+    thermal_vector: 外部导入并对齐后的热载荷数组
     """
     kp, ki, kd = params
+    # 场景列表
     options = ['jitter', 'maneuver', 'impact', 'mixed', 'thermal']
     total_loss = 0.0
 
-    # 模拟热变形需要的简化 mt_data (如果没有真实数据，Worker 内部构造)
-    # 假设热变形是一个缓慢变化的偏置
-    mt_data_dummy = np.sin(np.linspace(0, np.pi, tn_val)) * 0.05
+    # 权重系数
+    w_y = 1.0
+    w_yd = 10.0  # 对速度(振动)的惩罚更重
 
     for opt in options:
         try:
-            # 1. 动态生成噪声 (不设种子，确保随机性)
+            # 根据场景准备热数据
+            mt_data = thermal_vector if opt in ['thermal', 'mixed'] else None
+
+            # 1. 生成当前场景的噪声
+            # 注意：此处不设固定种子，让 GA 在轻微扰动中筛选最稳健的参数
             noise_data = create_noise_data(
                 tn=tn_val,
                 dt=dt_val,
                 option=opt,
                 system_config=config_dict,
                 projector_data=projector_data,
-                mt_data=mt_data_dummy
+                mt_data=mt_data
             )
 
-            # 2. 实例化仿真
+            # 2. 仿真
             sim = StateSpace(
                 config=config_dict,
                 noise_term=noise_data,
@@ -160,44 +62,55 @@ def evaluate_individual_robust(params, config_dict, projector_data, w_y, w_yd, d
                 dt=dt_val,
                 kp=kp, ki=ki, kd=kd
             )
-
             sim.solve()
 
-            # 3. 结果提取与发散检测
-            Y = sim.Y
-            if np.any(np.isnan(Y)) or np.max(np.abs(Y)) > 1e4:
-                return 1e15  # 只要有一种模式发散，该个体即被淘汰
+            # 3. 计算 Cost (能量泛函)
+            y = sim.Y
+            if np.any(np.isnan(y)) or np.max(np.abs(y)) > 0.5:  # 发散判据
+                return 1e10
 
-            Y_dot = sim.C @ sim.Xd
-            loss = np.sum(w_y * (Y ** 2) + w_yd * (Y_dot ** 2)) * dt_val
+            # 速度项 (从 Xd 中提取或近似)
+            # 假设 StateSpace 记录了输出 Y 的导数，或者通过 C @ Xd 计算
+            y_dot = sim.C @ sim.Xd
+
+            # 计算积分损失
+            loss = np.sum(w_y * (y ** 2) + w_yd * (y_dot ** 2)) * dt_val
             total_loss += loss
 
         except Exception:
-            return 1e15
+            return 1e10
 
-    return total_loss / len(options)  # 返回平均代价
+    return total_loss / len(options)
 
 
 # ==========================================
-# 4. 遗传算法优化器 (并行版)
+# 3. GA 优化器类
 # ==========================================
-
 class GAPIDOptimizerParallel:
-    def __init__(self, config_dict, projector_data, bounds, pop_size=200, generations=50, mutation_rate=0.3,
-                 num_cores=16):
-        self.config_dict = config_dict
-        self.projector_data = projector_data  # 传递投影系数字典
+    def __init__(self, conf, bounds, pop_size=100, generations=50, num_cores=8):
+        self.conf = conf
         self.bounds = bounds
         self.pop_size = pop_size
         self.generations = generations
-        self.mutation_rate = mutation_rate
         self.num_cores = num_cores
 
-        self.w_y = 1.0
-        self.w_yd = 10.0  # 增加对速度项的惩罚，有利于抑制振动
+        # --- 外部热载荷预处理 ---
+        raw_mt = conf.THERMAL_MOMENT
+        if isinstance(raw_mt, dict):
+            self.thermal_vector = raw_mt.get('M_thermal', np.zeros(conf.EPISODE_LENGTH)).flatten()
+        else:
+            self.thermal_vector = np.array(raw_mt).flatten()
 
-        self.best_fitness_history = []
-        self.best_params_history = []
+        # 强制对齐长度
+        if len(self.thermal_vector) < conf.EPISODE_LENGTH:
+            self.thermal_vector = np.pad(self.thermal_vector, (0, conf.EPISODE_LENGTH - len(self.thermal_vector)))
+        else:
+            self.thermal_vector = self.thermal_vector[:conf.EPISODE_LENGTH]
+
+        # 预计算投影系数
+        proj = BeamDisturbanceProjector(L=5.0, n_modes=4)
+        self.projector_data = proj.get_static_coeffs()
+
         self.population = self.init_population()
 
     def init_population(self):
@@ -207,106 +120,91 @@ class GAPIDOptimizerParallel:
             pop.append(ind)
         return pop
 
-    def select(self, population, fitnesses):
-        # 严格的精英保留：找到当前代绝对最优
-        sorted_indices = np.argsort(fitnesses)
-        best_individual = copy.deepcopy(population[sorted_indices[0]])
-
-        selected = [best_individual]  # 保留精英
-
-        # 锦标赛选择剩余个体
-        indices = np.arange(len(population))
-        for _ in range(self.pop_size - 1):
-            i1, i2 = np.random.choice(indices, 2, replace=False)
-            selected.append(copy.deepcopy(population[i1] if fitnesses[i1] < fitnesses[i2] else population[i2]))
-        return selected
-
-    def crossover(self, parent1, parent2):
-        # 算术交叉
-        alpha = np.random.rand()
-        child = [alpha * p1 + (1 - alpha) * p2 for p1, p2 in zip(parent1, parent2)]
-        return child
-
-    def mutate(self, individual):
-        for i, key in enumerate(['kp', 'ki', 'kd']):
-            if np.random.rand() < self.mutation_rate:
-                span = self.bounds[key][1] - self.bounds[key][0]
-                individual[i] += np.random.normal(0, span * 0.05)
-                individual[i] = np.clip(individual[i], self.bounds[key][0], self.bounds[key][1])
-        return individual
-
     def run(self):
-        print(f"开始鲁棒性优化 (模式: 5种环境混合) | 核心数: {self.num_cores}")
+        print(f"[*] 启动鲁棒性 GA 优化 | 核心数: {self.num_cores} | 种群: {self.pop_size}")
+        print(f"[*] 外部热载荷已对齐，长度: {len(self.thermal_vector)}")
+
+        best_ind = None
+        best_fit = float('inf')
 
         with multiprocessing.Pool(processes=self.num_cores) as pool:
             for gen in range(self.generations):
-                # 包装评估函数
+                # 包装评估函数，注入外部 Thermal 数组
                 eval_func = partial(
                     evaluate_individual_robust,
-                    config_dict=self.config_dict,
+                    config_dict=self.conf.SYSTEM_CONFIG,
                     projector_data=self.projector_data,
-                    w_y=self.w_y,
-                    w_yd=self.w_yd,
-                    dt_val=dt_sim,
-                    tn_val=tn_sim
+                    thermal_vector=self.thermal_vector,
+                    dt_val=self.conf.DT,
+                    tn_val=self.conf.EPISODE_LENGTH
                 )
 
-                fitnesses = np.array(pool.map(eval_func, self.population))
+                # 并行计算
+                fitnesses = pool.map(eval_func, self.population)
 
-                best_idx = np.argmin(fitnesses)
-                self.best_fitness_history.append(fitnesses[best_idx])
-                self.best_params_history.append(copy.deepcopy(self.population[best_idx]))
+                # 找到当前代最优
+                min_idx = np.argmin(fitnesses)
+                if fitnesses[min_idx] < best_fit:
+                    best_fit = fitnesses[min_idx]
+                    best_ind = copy.deepcopy(self.population[min_idx])
 
-                if gen % 5 == 0:
-                    print(f"Gen {gen:03d} | Best Cost: {fitnesses[best_idx]:.4e} | PID: {self.population[best_idx]}")
+                print(f"Gen {gen:03d} | Best Cost: {best_fit:.6e} | Best PID: {best_ind}")
 
-                # 进化操作
-                selected_pop = self.select(self.population, fitnesses)
-                next_pop = [selected_pop[0]]  # 确保存放精英
+                # --- 进化操作 (选择、交叉、变异) ---
+                self.population = self.evolve(fitnesses)
 
-                while len(next_pop) < self.pop_size:
-                    p1, p2 = np.random.choice(len(selected_pop), 2, replace=False)
-                    child = self.crossover(selected_pop[p1], selected_pop[p2])
-                    next_pop.append(self.mutate(child))
+        return best_ind
 
-                self.population = next_pop
+    def evolve(self, fitnesses):
+        # 简单的精英选择 + 交叉变异
+        sorted_indices = np.argsort(fitnesses)
+        new_pop = [copy.deepcopy(self.population[i]) for i in sorted_indices[:2]]  # 保留前2名精英
 
-        return self.best_params_history[-1]
+        while len(new_pop) < self.pop_size:
+            # 锦标赛选择
+            idx1, idx2 = np.random.choice(range(self.pop_size), 2, replace=False)
+            parent1 = self.population[idx1] if fitnesses[idx1] < fitnesses[idx2] else self.population[idx2]
+
+            idx3, idx4 = np.random.choice(range(self.pop_size), 2, replace=False)
+            parent2 = self.population[idx3] if fitnesses[idx3] < fitnesses[idx4] else self.population[idx4]
+
+            # 交叉
+            child = [(p1 + p2) / 2 + np.random.normal(0, 1.0) for p1, p2 in zip(parent1, parent2)]
+
+            # 变异与边界限制
+            for i, key in enumerate(['kp', 'ki', 'kd']):
+                child[i] = np.clip(child[i], self.bounds[key][0], self.bounds[key][1])
+
+            new_pop.append(child)
+        return new_pop
 
 
 # ==========================================
-# 5. 主程序入口
+# 4. 主程序执行
 # ==========================================
-
 if __name__ == "__main__":
+    # 多进程必须保护
     multiprocessing.freeze_support()
 
-    # 1. 初始化物理投影器 (提取静态系数用于并行)
-    from src.utils.utils import BeamDisturbanceProjector
+    # 1. 加载配置
+    conf_obj = Config()
 
-    projector = BeamDisturbanceProjector(L=5.0, n_modes=4)
-    proj_data = projector.get_static_coeffs()
-
-    # 2. 配置
-    config = Config()
-    system_dict = config.SYSTEM_CONFIG
-
-    pid_bounds = {
-        'kp': [0, 200],
-        'ki': [0, 50],
-        'kd': [0, 30]  # 动力学系统中 Kd 对阻尼贡献极大
+    # 2. 设定搜索边界
+    # 注意：对于带 Thermal 的系统，Ki 不能为 0，否则无法消除静差
+    bounds = {
+        'kp': [20.0, 200.0],
+        'ki': [1.0, 50.0],
+        'kd': [5.0, 40.0]
     }
 
     # 3. 运行优化
-    # 注意：不要在此处 set_seed，让 Worker 内部的随机数自然发挥
-    ga = GAPIDOptimizerParallel(
-        config_dict=system_dict,
-        projector_data=proj_data,
-        bounds=pid_bounds,
-        pop_size=1000,
-        generations=200,
-        num_cores=14
+    optimizer = GAPIDOptimizerParallel(
+        conf=conf_obj,
+        bounds=bounds,
+        pop_size=200,  # 根据你的 CPU 核心数调整
+        generations=100,
+        num_cores=14  # 你的机器有14核可用
     )
 
-    best_pid = ga.run()
-    print(f"最优参数确认为: {best_pid}")
+    best_pid = optimizer.run()
+    print(f"\n[FINAL] 鲁棒优化后的最优 PID 参数: {best_pid}")
