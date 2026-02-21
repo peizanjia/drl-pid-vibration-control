@@ -30,7 +30,7 @@ class Config:
     CRITIC_LR = 1e-4
 
     # 训练参数
-    GAMMA = 0.99
+    GAMMA = 0.9999
     TAU = 0.001
     BUFFER_SIZE = 150000
     BATCH_SIZE = 1024
