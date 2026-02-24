@@ -1,259 +1,446 @@
+# root/src/solvers/plot_pid_lqg_drlpid_baseline.py
+# Run (from project root):
+#   python -m src.solvers.plot_pid_lqg_drlpid_baseline
+#
+# Prerequisites:
+# 1) You have UPDATED root/src/solvers/state_space_baseline.py:
+#    - StateSpaceSimulator.run() uses env-consistent timing:
+#      Xd_col with u_old, ed based on that, u_new computed, RK4 k1 uses u_old, k2-4 use u_new.
+#    - (optional) run() calls controller.log_step(i) if available (the patch I provided).
+#
+# 2) Your trained model exists, e.g. models/ddpg_ep_70.pth
+#
+# Outputs:
+# results/baseline_pid_lqg_compare/<scenario>_fig{1,2,3}_*.pdf (vector)
+
+from __future__ import annotations
+
+import os
+import sys
+import random
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import os
-import sys
 
-# ==========================================
-# 1. 核心路径与环境修复 (解决跨目录 Import)
-# ==========================================
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-
-# 强制计算 root 目录
+# -------------------------
+# Path fix
+# -------------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 current_file = os.path.abspath(__file__)
-project_root = os.path.dirname(os.path.dirname(current_file))
-
+project_root = os.path.dirname(os.path.dirname(current_file))  # .../root
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# 现在安全导入项目模块
-from src.environments.environment_2 import PIDControlEnvironment
+# -------------------------
+# Project imports
+# -------------------------
+from config.config import Config
+from config.config_loader import load_mat
 from src.agents.ddpg_agent import DDPGAgent
 from src.utils.utils import BeamDisturbanceProjector, create_noise_data
-from src.solvers.state_space_2 import StateSpace
-from config import config
+
+from src.solvers.state_space_baseline import (
+    StateSpaceSimulator, SimConfig,
+    make_fixed_pid_controller, make_lqg_controller,
+    ControllerBase,
+)
 
 
-# ==========================================
-# 2. 核心评估函数
-# ==========================================
-def evaluate_performance(agent, config_instance, scenario_settings, model_rel_path, seed=42):
+# ============================================================
+# 1) DRL-PID controller (ENV-consistent 5D obs):
+#    state = [u_prev, e, ei, ed, t_norm]
+# ============================================================
+
+class DRLPIDController(ControllerBase):
     """
-    Args:
-        model_rel_path: 相对路径，如 "models/ddpg_ep_70.pth"
+    Uses a trained DDPG actor to output PID params. Obs matches PIDControlEnvironment:
+
+      s_i = [u_{i-1}, e_i, ei_i, ed_i, i/T]
+
+    Timing alignment:
+      - y_now, xdot (based on u_old) are provided by simulator.run() BEFORE controller.compute()
+      - controller.compute() updates (e, ei, ed) using these and produces u_new
+      - u_prev for next step is set to u_new (stored internally)
     """
-    # --- 初始化环境参数 ---
-    torch.manual_seed(seed)
-    np.random.seed(seed)
 
-    # --- 模型加载 (绝对路径保证) ---
-    full_model_path = os.path.join(project_root, model_rel_path)
-    if os.path.exists(full_model_path):
-        agent.load_models(full_model_path)
-        agent.actor.eval()
-        print(f"[INFO] 成功加载模型权重: {full_model_path}")
-    else:
-        raise FileNotFoundError(f"找不到模型文件: {full_model_path}")
+    def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int):
+        self.agent = agent
+        self.conf = conf
+        self.T = episode_length
 
-    # --- 获取外部导入的热数据 (重点) ---
-    # 假设 config.py 里通过 config_loader 加载了 THERMAL_MOMENT
-    raw_thermal = config_instance.THERMAL_MOMENT
-    if isinstance(raw_thermal, dict):
-        # 兼容 .mat 导入后的字典格式
-        thermal_vector = raw_thermal.get('M_thermal', np.zeros(config_instance.EPISODE_LENGTH)).flatten()
-    else:
-        thermal_vector = np.array(raw_thermal).flatten()
+        # internal cached signals
+        self.u_prev = 0.0
+        self.e = 0.0
+        self.ei = 0.0
+        self.ed = 0.0
+        self.step_idx = 0
 
-    # --- 预计算 Beam 静态系数 ---
+        # histories
+        self.kp_hist = None
+        self.ki_hist = None
+        self.kd_hist = None
+        self.u_hist = None
+        self.e_hist = None
+        self.ei_hist = None
+        self.ed_hist = None
+
+        self._last_pid = (0.0, 0.0, 0.0)
+
+    def reset(self) -> None:
+        self.u_prev = 0.0
+        self.e = 0.0
+        self.ei = 0.0
+        self.ed = 0.0
+        self.step_idx = 0
+        self._last_pid = (0.0, 0.0, 0.0)
+
+        self.kp_hist = self.ki_hist = self.kd_hist = None
+        self.u_hist = None
+        self.e_hist = self.ei_hist = self.ed_hist = None
+
+    def setup_history(self, tn: int) -> None:
+        self.kp_hist = np.zeros(tn, dtype=float)
+        self.ki_hist = np.zeros(tn, dtype=float)
+        self.kd_hist = np.zeros(tn, dtype=float)
+        self.u_hist = np.zeros(tn, dtype=float)
+        self.e_hist = np.zeros(tn, dtype=float)
+        self.ei_hist = np.zeros(tn, dtype=float)
+        self.ed_hist = np.zeros(tn, dtype=float)
+
+    def _obs(self, t_norm: float) -> np.ndarray:
+        return np.array([self.u_prev, self.e, self.ei, self.ed, t_norm], dtype=np.float32)
+
+    def compute(self, *, x: np.ndarray, xdot: np.ndarray, y: float, dt: float, t: float) -> float:
+        # env-consistent: at step i, simulator has computed xdot using u_old and passed it in.
+        # In env: e=y_now, ei += e*dt, ed = C@Xd_col. Here ed is already computed upstream as C@Xd_col
+        # BUT simulator passes full xdot, not ed. So we must compute ed = C@xdot? No: env stores ed = (C@Xd_col).item().
+        # We can emulate env by recomputing ed as dot(C, xdot) IF C is available.
+        # In this controller, we assume ed is already embedded in y? Not.
+        # Solution: use env definition: ed := derivative of y = C xdot. We can compute it only if we know C.
+        # Since env uses that, we fetch C from config.SYSTEM_CONFIG at init? Not available here.
+        # Safer: approximate ed with ydot = y - y_prev over dt? Not env-consistent.
+        #
+        # Therefore: this DRL controller should be constructed with C, or simulator should pass ed directly.
+        # We take the pragmatic route: compute ed as (y - y_prev)/dt using internal y_prev.
+        # But to remain STRICTLY env-consistent, pass C into this controller and compute ed = C@xdot.
+        raise RuntimeError(
+            "DRLPIDController needs measurement derivative ed consistent with env: ed = C@xdot(u_old). "
+            "Please construct DRLPIDController with system C and compute ed = C @ xdot."
+        )
+
+    def log_step(self, i: int) -> None:
+        if self.u_hist is not None:
+            kp, ki, kd = self._last_pid
+            self.kp_hist[i] = kp
+            self.ki_hist[i] = ki
+            self.kd_hist[i] = kd
+            self.u_hist[i] = self.u_prev
+            self.e_hist[i] = self.e
+            self.ei_hist[i] = self.ei
+            self.ed_hist[i] = self.ed
+
+    def export(self) -> Dict[str, Any]:
+        return {
+            "kp": self.kp_hist, "ki": self.ki_hist, "kd": self.kd_hist,
+            "u_prev": self.u_hist,
+            "e": self.e_hist, "ei": self.ei_hist, "ed": self.ed_hist,
+        }
+
+
+# ---------- Correct env-consistent DRL controller with C ----------
+class DRLPIDControllerWithC(DRLPIDController):
+    def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int, C: np.ndarray):
+        super().__init__(agent, conf, episode_length)
+        self.C = C.reshape(1, -1)
+
+    def compute(self, *, x: np.ndarray, xdot: np.ndarray, y: float, dt: float, t: float) -> float:
+        i = self.step_idx
+        if i >= self.T:
+            i = self.T - 1
+        t_norm = float(i / self.T)  # env: i / episode_length
+
+        # env-consistent internal update
+        self.e = float(y)
+        self.ei = float(self.ei + self.e * dt)
+        self.ed = (self.C @ xdot.reshape(-1, 1)).item()  # ed = C * Xd_col(u_old)
+
+        obs = self._obs(t_norm)
+        action = self.agent.select_action(obs, add_noise=False)
+        pid_phys = self.conf.denormalize_action(action)
+
+        kp, ki, kd = float(pid_phys[0]), float(pid_phys[1]), float(pid_phys[2])
+        self._last_pid = (kp, ki, kd)
+
+        u = kp * self.e - ki * self.ei - kd * self.ed
+
+        # shift for next step (u_prev = u_new)
+        self.u_prev = float(u)
+        self.step_idx += 1
+        return float(u)
+
+
+# ============================================================
+# 2) Plot helpers (vector PDF)
+# ============================================================
+
+def setup_plot_style():
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["ps.fonttype"] = 42
+    plt.rcParams["font.size"] = 10
+    plt.rcParams["axes.linewidth"] = 0.8
+    plt.rcParams["lines.linewidth"] = 1.0
+    plt.rcParams["axes.grid"] = True
+    plt.rcParams["grid.linestyle"] = ":"
+    plt.rcParams["grid.alpha"] = 0.35
+
+
+def tip_disp(X: np.ndarray) -> np.ndarray:
+    return -2.0 * X[0, :] + 2.0 * X[1, :]
+
+
+def add_inset(ax, t, y, zoom_range: Tuple[float, float], loc="upper right"):
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
+    axins = inset_axes(ax, width="38%", height="38%", loc=loc, borderpad=1.0)
+    axins.plot(t, y)
+    axins.set_xlim(zoom_range[0], zoom_range[1])
+
+    mask = (t >= zoom_range[0]) & (t <= zoom_range[1])
+    if np.any(mask):
+        yy = y[mask]
+        pad = 0.08 * (np.max(yy) - np.min(yy) + 1e-12)
+        axins.set_ylim(np.min(yy) - pad, np.max(yy) + pad)
+
+    axins.grid(True, linestyle=":", alpha=0.35)
+    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.3", lw=0.8)
+
+
+def save_three_figs(
+    out_dir: Path,
+    scenario_key: str,
+    t: np.ndarray,
+    res_un: Dict[str, Any],
+    res_drl: Dict[str, Any],
+    res_pid: Dict[str, Any],
+    res_lqg: Dict[str, Any],
+    plot_range: Tuple[float, float],
+    zoom_range: Optional[Tuple[float, float]],
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mask = (t >= plot_range[0]) & (t <= plot_range[1])
+
+    Yu, Zu, Uu = res_un["Y"], tip_disp(res_un["X"]), res_un["U"]
+    Yd, Zd, Ud = res_drl["Y"], tip_disp(res_drl["X"]), res_drl["U"]
+    Yp, Zp, Up = res_pid["Y"], tip_disp(res_pid["X"]), res_pid["U"]
+    Yg, Zg, Ug = res_lqg["Y"], tip_disp(res_lqg["X"]), res_lqg["U"]
+
+    c_un  = "0.25"
+    c_drl = "#1f77b4"
+    c_pid = "#ff7f0e"
+    c_lqg = "#2ca02c"
+
+    # Fig1
+    fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
+    ax1.plot(t[mask], Yu[mask], color=c_un, linestyle="--", alpha=0.75, label="Uncontrolled (PID=0)")
+    ax1.plot(t[mask], Yd[mask], color=c_drl, linestyle="-", alpha=0.95, label="DRL-PID")
+    ax1.set_ylabel("Sensor voltage $y$")
+    ax1.set_title(f"{scenario_key} | Uncontrolled vs DRL-PID", fontweight="bold")
+    ax1.legend(frameon=False, loc="upper right")
+
+    ax2.plot(t[mask], Zu[mask], color=c_un, linestyle="--", alpha=0.75, label="Uncontrolled (PID=0)")
+    ax2.plot(t[mask], Zd[mask], color=c_drl, linestyle="-", alpha=0.95, label="DRL-PID")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel(r"Tip disp. $z=-2\eta_1+2\eta_2$")
+    ax2.legend(frameon=False, loc="upper right")
+
+    if zoom_range is not None:
+        add_inset(ax1, t, Yd, zoom_range)
+        add_inset(ax2, t, Zd, zoom_range)
+
+    fig1.tight_layout()
+    fig1.savefig(out_dir / f"{scenario_key}_fig1_unctrl_vs_drl.pdf", bbox_inches="tight")
+    plt.close(fig1)
+
+    # Fig2
+    fig2, (bx1, bx2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
+    bx1.plot(t[mask], Yd[mask], color=c_drl, label="DRL-PID")
+    bx1.plot(t[mask], Yp[mask], color=c_pid, label="Large Gain PID")
+    bx1.plot(t[mask], Yg[mask], color=c_lqg, label="LQG")
+    bx1.set_ylabel("Sensor voltage $y$")
+    bx1.set_title(f"{scenario_key} | DRL-PID vs Large Gain PID vs LQG", fontweight="bold")
+    bx1.legend(frameon=False, loc="upper right")
+
+    bx2.plot(t[mask], Zd[mask], color=c_drl, label="DRL-PID")
+    bx2.plot(t[mask], Zp[mask], color=c_pid, label="Large Gain PID")
+    bx2.plot(t[mask], Zg[mask], color=c_lqg, label="LQG")
+    bx2.set_xlabel("Time (s)")
+    bx2.set_ylabel(r"Tip disp. $z=-2\eta_1+2\eta_2$")
+    bx2.legend(frameon=False, loc="upper right")
+
+    if zoom_range is not None:
+        add_inset(bx1, t, Yd, zoom_range)
+        add_inset(bx2, t, Zd, zoom_range)
+
+    fig2.tight_layout()
+    fig2.savefig(out_dir / f"{scenario_key}_fig2_drl_pid_lqg.pdf", bbox_inches="tight")
+    plt.close(fig2)
+
+    # Fig3
+    fig3, cx = plt.subplots(1, 1, figsize=(6.6, 3.3))
+    cx.plot(t[mask], Ud[mask], color=c_drl, label="DRL-PID")
+    cx.plot(t[mask], Up[mask], color=c_pid, label="Large Gain PID")
+    cx.plot(t[mask], Ug[mask], color=c_lqg, label="LQG")
+    cx.set_xlabel("Time (s)")
+    cx.set_ylabel("Control voltage $u$")
+    cx.set_title(f"{scenario_key} | Control input", fontweight="bold")
+    cx.legend(frameon=False, loc="upper right")
+
+    if zoom_range is not None:
+        add_inset(cx, t, Ud, zoom_range)
+
+    fig3.tight_layout()
+    fig3.savefig(out_dir / f"{scenario_key}_fig3_u_compare.pdf", bbox_inches="tight")
+    plt.close(fig3)
+
+
+# ============================================================
+# 3) Main
+# ============================================================
+
+def main():
+    setup_plot_style()
+
+    SEED = 123
+    np.random.seed(SEED)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    conf = Config()
+    tn = conf.EPISODE_LENGTH
+    dt = conf.DT
+
+    # Agent
+    agent = DDPGAgent(conf)
+
+    model_rel = r"models\ddpg_ep_100.pth"
+    model_path = os.path.join(project_root, model_rel)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    agent.load_models(model_path)
+    agent.actor.eval()
+    print(f"[INFO] Loaded model: {model_path}")
+
+    # thermal data
+    try:
+        mt_loaded = load_mat()
+    except Exception:
+        mt_loaded = None
+
+    # projector
     proj = BeamDisturbanceProjector(L=5.0, n_modes=4)
     projector_data = proj.get_static_coeffs()
 
-    # 创建保存目录
-    save_dir = os.path.join(project_root, "results", "evaluation")
-    os.makedirs(save_dir, exist_ok=True)
+    out_dir = Path(project_root) / "results" / "baseline_pid_lqg_compare"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ==========================================
-    # 3. 循环测试场景
-    # ==========================================
-    for scenario_name, settings in scenario_settings.items():
-        print(f"\n>>> 正在测试场景: {scenario_name}")
+    # exactly 5 scenarios
+    scenarios = {
+        "Jitter":   {"noise_option": "jitter",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
+        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 100.0), "zoom_range": (60.0, 70.0)},
+        "Impact":   {"noise_option": "impact",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (5.0, 30.0),  "zoom_range": (5.0, 15.0)},
+        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (10.0, 30.0), "zoom_range": None},
+        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 100.0), "zoom_range": (60.0, 70.0)},
+    }
 
-        noise_opt = settings.get('noise_option', 'normal')
-        fixed_pid = settings.get('fixed_pid', [80.0, 15.0, 20.0])
-        p_range = settings.get('plot_range', [0, 100])
-        z_range = settings.get('zoom_range', None)
+    # LQG hyperparameters
+    Q_lqr = np.diag([1, 1, 10, 10])
+    R_lqr = np.array([[1e-7]])
+    W_kf = np.diag([1e-6, 1e-6, 1e-3, 1e-3])
+    V_kf = np.array([[1e-4]])
 
-        # 锁定随机数种子保证公平性
-        np.random.seed(seed + 100)
+    # thermal vector extraction (match your original evaluation)
+    thermal_vector = None
+    raw_thermal = getattr(conf, "THERMAL_MOMENT", None)
+    if raw_thermal is not None:
+        if isinstance(raw_thermal, dict):
+            thermal_vector = raw_thermal.get("M_thermal", np.zeros(tn)).flatten()
+        else:
+            thermal_vector = np.array(raw_thermal).flatten()
 
-        # ---------------------------------------
-        # A. 数据对齐与噪声生成
-        # ---------------------------------------
+    for scen_name, cfg in scenarios.items():
+        noise_opt = cfg["noise_option"]
+        fixed_pid = cfg["fixed_pid"]
+        plot_range = cfg["plot_range"]
+        zoom_range = cfg["zoom_range"]
+
+        # per-scenario deterministic seed
+        scen_seed = (SEED + (abs(hash(scen_name)) % 100000)) % (2**32 - 1)
+        np.random.seed(scen_seed)
+        random.seed(scen_seed)
+        torch.manual_seed(scen_seed)
+
+        # mt_input only for thermal/mixed
         mt_input = None
-        if noise_opt in ['thermal', 'mixed']:
-            # 严格截取外部导入的热数据，对齐时间步
-            if len(thermal_vector) >= config_instance.EPISODE_LENGTH:
-                mt_input = thermal_vector[:config_instance.EPISODE_LENGTH]
+        if noise_opt in ["thermal", "mixed"] and thermal_vector is not None:
+            if len(thermal_vector) >= tn:
+                mt_input = thermal_vector[:tn]
             else:
-                mt_input = np.pad(thermal_vector, (0, config_instance.EPISODE_LENGTH - len(thermal_vector)))
+                mt_input = np.pad(thermal_vector, (0, tn - len(thermal_vector)))
 
         noise_data = create_noise_data(
-            tn=config_instance.EPISODE_LENGTH,
-            dt=config_instance.DT,
+            tn=tn,
+            dt=dt,
             option=noise_opt,
-            system_config=config_instance.SYSTEM_CONFIG,
+            system_config=conf.SYSTEM_CONFIG,
             mt_data=mt_input,
             projector_data=projector_data
         )
 
-        # ---------------------------------------
-        # B. RL 自适应仿真
-        # ---------------------------------------
-        env_rl = PIDControlEnvironment(config_instance)
-        # 注入 StateSpace
-        ss_rl = StateSpace(
-            config_instance.SYSTEM_CONFIG, noise_data,
-            dt=config_instance.DT, tn=config_instance.EPISODE_LENGTH,
-            kp=config_instance.KP_RANGE[0], ki=config_instance.KI_RANGE[0], kd=config_instance.KD_RANGE[0]
+        sim = StateSpaceSimulator(
+            system_config=conf.SYSTEM_CONFIG,
+            noise_term=noise_data,
+            sim_cfg=SimConfig(dt=dt, tn=tn, u_limit=None, meas_noise_std=0.0)
         )
-        env_rl.set_state_space(ss_rl)
 
-        obs = env_rl.reset()
-        done = False
-        rl_log = {'y': [], 'kp': [], 'ki': [], 'kd': []}
+        # controllers
+        ctrl_un = make_fixed_pid_controller(conf.SYSTEM_CONFIG, kp=0.0, ki=0.0, kd=0.0)
 
-        while not done:
-            action = agent.select_action(obs, add_noise=False)  # 测试不加噪声
-            phys_pid = config_instance.denormalize_action(action)
+        ctrl_drl = DRLPIDControllerWithC(agent=agent, conf=conf, episode_length=tn, C=sim.C)
 
-            rl_log['kp'].append(phys_pid[0])
-            rl_log['ki'].append(phys_pid[1])
-            rl_log['kd'].append(phys_pid[2])
+        ctrl_pid = make_fixed_pid_controller(conf.SYSTEM_CONFIG, kp=fixed_pid[0], ki=fixed_pid[1], kd=fixed_pid[2])
 
-            obs, _, done, info = env_rl.step(action)
-            rl_log['y'].append(info['output'])
-
-        # ---------------------------------------
-        # C. 固定 PID 仿真 (Baseline)
-        # ---------------------------------------
-        env_fix = PIDControlEnvironment(config_instance)
-        ss_fix = StateSpace(
-            config_instance.SYSTEM_CONFIG, noise_data,
-            dt=config_instance.DT, tn=config_instance.EPISODE_LENGTH,
-            kp=fixed_pid[0], ki=fixed_pid[1], kd=fixed_pid[2]
+        ctrl_lqg = make_lqg_controller(
+            conf.SYSTEM_CONFIG, dt=dt,
+            Q_lqr=Q_lqr, R_lqr=R_lqr,
+            W_kf=W_kf, V_kf=V_kf
         )
-        env_fix.set_state_space(ss_fix)
 
-        obs = env_fix.reset()
-        done = False
-        fix_y = []
-        # 固定参数归一化传入 step
-        fix_action = config_instance.normalize_action(np.array(fixed_pid))
+        # run (same noise_data)
+        res_un = sim.run(ctrl_un)
+        res_drl = sim.run(ctrl_drl)
+        res_pid = sim.run(ctrl_pid)
+        res_lqg = sim.run(ctrl_lqg)
 
-        while not done:
-            _, _, done, info = env_fix.step(fix_action)
-            fix_y.append(info['output'])
+        # save figs (vector PDF)
+        t = res_un["t"]
+        save_three_figs(
+            out_dir=out_dir,
+            scenario_key=scen_name,
+            t=t,
+            res_un=res_un,
+            res_drl=res_drl,
+            res_pid=res_pid,
+            res_lqg=res_lqg,
+            plot_range=plot_range,
+            zoom_range=zoom_range
+        )
+        print(f"[OK] {scen_name} -> {out_dir}")
 
-        # ---------------------------------------
-        # D. 专业力学绘图
-        # ---------------------------------------
-        time = np.arange(len(rl_log['y'])) * config_instance.DT
-        mask = (time >= p_range[0]) & (time <= p_range[1])
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 8), sharex=True,
-                                       gridspec_kw={'height_ratios': [2, 1]})
-
-        # Subplot 1: 位移响应
-        ax1.plot(time[mask], np.array(fix_y)[mask], 'k--', alpha=0.5, label=f'Fixed PID {fixed_pid}')
-        ax1.plot(time[mask], np.array(rl_log['y'])[mask], 'r-', linewidth=1.2, label='RL-Adaptive PID')
-        ax1.set_ylabel('Sensor Voltage (V)', fontsize=11)
-        ax1.set_title(f'Scenario: {scenario_name} (Noise: {noise_opt})', fontweight='bold')
-        ax1.legend(loc='upper right', frameon=True)
-        ax1.grid(True, which='both', linestyle=':', alpha=0.7)
-
-        # Inset Zoom 局部放大
-        if z_range:
-            axins = ax1.inset_axes([0.6, 0.15, 0.35, 0.35])
-            axins.plot(time, fix_y, 'k--', alpha=0.4)
-            axins.plot(time, rl_log['y'], 'r-')
-            axins.set_xlim(z_range[0], z_range[1])
-            # 自动计算放大区 Y 轴
-            z_m = (time >= z_range[0]) & (time <= z_range[1])
-            z_vals = np.array(rl_log['y'])[z_m]
-            if len(z_vals) > 0:
-                axins.set_ylim(np.min(z_vals) * 1.2, np.max(z_vals) * 1.2)
-            axins.grid(True)
-            ax1.indicate_inset_zoom(axins, edgecolor="black")
-
-        # Subplot 2: Kp 自适应曲线
-        ax2.plot(time[mask], np.array(rl_log['kp'])[mask], 'b-', label='Adaptive Kp')
-        ax2.set_ylabel('Gain $K_p$', fontsize=11)
-        ax2.set_xlabel('Time (s)', fontsize=11)
-        ax2.legend(loc='upper right')
-        ax2.grid(True, linestyle=':', alpha=0.7)
-
-        plt.tight_layout()
-        safe_name = scenario_name.lower().replace(" ", "_")
-        plt.savefig(os.path.join(save_dir, f"{safe_name}.png"), dpi=300)
-        print(f"[SUCCESS] 图像已保存至: {save_dir}/{safe_name}.png")
-        plt.close()
+    print(f"\nAll done. Output dir: {out_dir}")
 
 
 if __name__ == "__main__":
-    # 1. 实例化配置
-    conf = config.Config()
-
-    # 2. 实例化 Agent
-    agent = DDPGAgent(conf)
-
-    # 3. 【核心设置】在这里配置你想测试的所有场景
-    # 格式: '图表标题': { 参数... }
-    SCENARIO_CONFIG = {
-        # 场景 A: 正常工况，画前 20 秒
-        "Normal Operation": {
-            "noise_option": "normal",
-            "fixed_pid": [150.0, 30.0, 20.0],  # 基准 PID
-            "plot_range": [0, 10],  # 只画 0-20s
-            "zoom_range": None
-        },
-
-        "Jitter Operation": {
-            "noise_option": "jitter",
-            "fixed_pid": [150.0, 30.0, 20.0],  # 基准 PID
-            "plot_range": [0, 10],  # 只画 0-20s
-            "zoom_range": None
-        },
-
-        "Thermal_Stability": {
-            "noise_option": "thermal",  # 触发外部 mt_data 逻辑
-            "fixed_pid": [150.0, 30.0, 20.0],
-            "plot_range": [0, 100],
-            "zoom_range": [60, 70]
-        },
-
-        # 场景 B: 冲击扰动，画冲击发生的前后
-        "Micrometeoroid Impact": {
-            "noise_option": "impact",
-            "fixed_pid": [150.0, 30.0, 20.0],
-            "plot_range": [0, 30],  # 画前50s看收敛
-            "zoom_range": [5, 10]  # 假设冲击大概在 5s 左右，放大这里
-        },
-
-        # 场景 C: 姿态机动，全过程
-        "Slew Maneuver": {
-            "noise_option": "maneuver",
-            "fixed_pid": [150.0, 30.0, 20.0],  # 也许机动需要软一点的 PID
-            "plot_range": [10, 30],  # None 表示画全部 config.EPISODE_LENGTH
-            "zoom_range": None  # 放大机动中间段
-        },
-
-        # 场景 D: 混合恶劣工况
-        "Mixed Extreme": {
-            "noise_option": "mixed",
-            "fixed_pid": [150.0, 30.0, 20.0],
-            "plot_range": [0, 100],
-            "zoom_range": [80, 85]
-        }
-    }
-
-    # 4. 运行评估
-    # 确保你有 best_model.pth，或者改为其他路径
-    model_path = "models\\ddpg_ep_70.pth"
-
-    evaluate_performance(
-        agent=agent,
-        config_instance=conf,
-        scenario_settings=SCENARIO_CONFIG,
-        model_rel_path=model_path,
-        seed=123
-    )
+    main()
