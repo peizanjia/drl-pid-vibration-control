@@ -1,17 +1,6 @@
 # root/src/solvers/plot_pid_lqg_drlpid_baseline.py
 # Run (from project root):
 #   python -m src.solvers.plot_pid_lqg_drlpid_baseline
-#
-# Prerequisites:
-# 1) You have UPDATED root/src/solvers/state_space_baseline.py:
-#    - StateSpaceSimulator.run() uses env-consistent timing:
-#      Xd_col with u_old, ed based on that, u_new computed, RK4 k1 uses u_old, k2-4 use u_new.
-#    - (optional) run() calls controller.log_step(i) if available (the patch I provided).
-#
-# 2) Your trained model exists, e.g. models/ddpg_ep_70.pth
-#
-# Outputs:
-# results/baseline_pid_lqg_compare/<scenario>_fig{1,2,3}_*.pdf (vector)
 
 from __future__ import annotations
 
@@ -19,7 +8,8 @@ import os
 import sys
 import random
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
+import zlib
 
 import numpy as np
 import torch
@@ -50,42 +40,24 @@ from src.solvers.state_space_baseline import (
 
 
 # ============================================================
-# 1) DRL-PID controller (ENV-consistent 5D obs):
-#    state = [u_prev, e, ei, ed, t_norm]
+# 1) DRL-PID controller (ENV-consistent 5D obs)
 # ============================================================
 
 class DRLPIDController(ControllerBase):
-    """
-    Uses a trained DDPG actor to output PID params. Obs matches PIDControlEnvironment:
-
-      s_i = [u_{i-1}, e_i, ei_i, ed_i, i/T]
-
-    Timing alignment:
-      - y_now, xdot (based on u_old) are provided by simulator.run() BEFORE controller.compute()
-      - controller.compute() updates (e, ei, ed) using these and produces u_new
-      - u_prev for next step is set to u_new (stored internally)
-    """
-
     def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int):
         self.agent = agent
         self.conf = conf
         self.T = episode_length
 
-        # internal cached signals
         self.u_prev = 0.0
         self.e = 0.0
         self.ei = 0.0
         self.ed = 0.0
         self.step_idx = 0
 
-        # histories
         self.kp_hist = None
         self.ki_hist = None
         self.kd_hist = None
-        self.u_hist = None
-        self.e_hist = None
-        self.ei_hist = None
-        self.ed_hist = None
 
         self._last_pid = (0.0, 0.0, 0.0)
 
@@ -98,59 +70,26 @@ class DRLPIDController(ControllerBase):
         self._last_pid = (0.0, 0.0, 0.0)
 
         self.kp_hist = self.ki_hist = self.kd_hist = None
-        self.u_hist = None
-        self.e_hist = self.ei_hist = self.ed_hist = None
 
     def setup_history(self, tn: int) -> None:
         self.kp_hist = np.zeros(tn, dtype=float)
         self.ki_hist = np.zeros(tn, dtype=float)
         self.kd_hist = np.zeros(tn, dtype=float)
-        self.u_hist = np.zeros(tn, dtype=float)
-        self.e_hist = np.zeros(tn, dtype=float)
-        self.ei_hist = np.zeros(tn, dtype=float)
-        self.ed_hist = np.zeros(tn, dtype=float)
 
     def _obs(self, t_norm: float) -> np.ndarray:
         return np.array([self.u_prev, self.e, self.ei, self.ed, t_norm], dtype=np.float32)
 
-    def compute(self, *, x: np.ndarray, xdot: np.ndarray, y: float, dt: float, t: float) -> float:
-        # env-consistent: at step i, simulator has computed xdot using u_old and passed it in.
-        # In env: e=y_now, ei += e*dt, ed = C@Xd_col. Here ed is already computed upstream as C@Xd_col
-        # BUT simulator passes full xdot, not ed. So we must compute ed = C@xdot? No: env stores ed = (C@Xd_col).item().
-        # We can emulate env by recomputing ed as dot(C, xdot) IF C is available.
-        # In this controller, we assume ed is already embedded in y? Not.
-        # Solution: use env definition: ed := derivative of y = C xdot. We can compute it only if we know C.
-        # Since env uses that, we fetch C from config.SYSTEM_CONFIG at init? Not available here.
-        # Safer: approximate ed with ydot = y - y_prev over dt? Not env-consistent.
-        #
-        # Therefore: this DRL controller should be constructed with C, or simulator should pass ed directly.
-        # We take the pragmatic route: compute ed as (y - y_prev)/dt using internal y_prev.
-        # But to remain STRICTLY env-consistent, pass C into this controller and compute ed = C@xdot.
-        raise RuntimeError(
-            "DRLPIDController needs measurement derivative ed consistent with env: ed = C@xdot(u_old). "
-            "Please construct DRLPIDController with system C and compute ed = C @ xdot."
-        )
-
     def log_step(self, i: int) -> None:
-        if self.u_hist is not None:
+        if self.kp_hist is not None:
             kp, ki, kd = self._last_pid
             self.kp_hist[i] = kp
             self.ki_hist[i] = ki
             self.kd_hist[i] = kd
-            self.u_hist[i] = self.u_prev
-            self.e_hist[i] = self.e
-            self.ei_hist[i] = self.ei
-            self.ed_hist[i] = self.ed
 
     def export(self) -> Dict[str, Any]:
-        return {
-            "kp": self.kp_hist, "ki": self.ki_hist, "kd": self.kd_hist,
-            "u_prev": self.u_hist,
-            "e": self.e_hist, "ei": self.ei_hist, "ed": self.ed_hist,
-        }
+        return {"kp": self.kp_hist, "ki": self.ki_hist, "kd": self.kd_hist}
 
 
-# ---------- Correct env-consistent DRL controller with C ----------
 class DRLPIDControllerWithC(DRLPIDController):
     def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int, C: np.ndarray):
         super().__init__(agent, conf, episode_length)
@@ -160,12 +99,11 @@ class DRLPIDControllerWithC(DRLPIDController):
         i = self.step_idx
         if i >= self.T:
             i = self.T - 1
-        t_norm = float(i / self.T)  # env: i / episode_length
+        t_norm = float(i / self.T)
 
-        # env-consistent internal update
         self.e = float(y)
         self.ei = float(self.ei + self.e * dt)
-        self.ed = (self.C @ xdot.reshape(-1, 1)).item()  # ed = C * Xd_col(u_old)
+        self.ed = float((self.C @ np.asarray(xdot).reshape(-1, 1)).item())
 
         obs = self._obs(t_norm)
         action = self.agent.select_action(obs, add_noise=False)
@@ -176,14 +114,18 @@ class DRLPIDControllerWithC(DRLPIDController):
 
         u = kp * self.e - ki * self.ei - kd * self.ed
 
-        # shift for next step (u_prev = u_new)
+        # if simulator.run() calls set_applied_u, this will be overwritten to saturated u
         self.u_prev = float(u)
+
         self.step_idx += 1
         return float(u)
 
+    def set_applied_u(self, u_applied: float) -> None:
+        self.u_prev = float(u_applied)
+
 
 # ============================================================
-# 2) Plot helpers (vector PDF)
+# 2) Plot helpers
 # ============================================================
 
 def setup_plot_style():
@@ -191,31 +133,72 @@ def setup_plot_style():
     plt.rcParams["ps.fonttype"] = 42
     plt.rcParams["font.size"] = 10
     plt.rcParams["axes.linewidth"] = 0.8
-    plt.rcParams["lines.linewidth"] = 1.0
     plt.rcParams["axes.grid"] = True
     plt.rcParams["grid.linestyle"] = ":"
-    plt.rcParams["grid.alpha"] = 0.35
+    plt.rcParams["grid.alpha"] = 0.30
 
 
 def tip_disp(X: np.ndarray) -> np.ndarray:
     return -2.0 * X[0, :] + 2.0 * X[1, :]
 
 
-def add_inset(ax, t, y, zoom_range: Tuple[float, float], loc="upper right"):
+def add_inset_multi(
+    ax,
+    series: List[Tuple[np.ndarray, np.ndarray, str, str, float, int]],
+    zoom_range: Tuple[float, float],
+    *,
+    inset_loc: str = "upper right",
+    legend_loc: str = "lower left",
+    show_zero_ref: bool = False,
+):
+    """
+    series: list of (t, y, color, label, linewidth, zorder)
+    inset 内线条更细，并带 legend
+    """
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
-    axins = inset_axes(ax, width="38%", height="38%", loc=loc, borderpad=1.0)
-    axins.plot(t, y)
+
+    axins = inset_axes(ax, width="40%", height="40%", loc=inset_loc, borderpad=1.0)
+
+    for (tt, yy, c, lab, lw, zo) in series:
+        axins.plot(tt, yy, color=c, linewidth=lw, label=lab, zorder=zo)
+
     axins.set_xlim(zoom_range[0], zoom_range[1])
 
-    mask = (t >= zoom_range[0]) & (t <= zoom_range[1])
+    mask = (series[0][0] >= zoom_range[0]) & (series[0][0] <= zoom_range[1])
     if np.any(mask):
-        yy = y[mask]
-        pad = 0.08 * (np.max(yy) - np.min(yy) + 1e-12)
-        axins.set_ylim(np.min(yy) - pad, np.max(yy) + pad)
+        vals = []
+        for (tt, yy, _, _, _, _) in series:
+            vals.append(yy[mask])
+        yall = np.concatenate(vals)
+        pad = 0.10 * (np.max(yall) - np.min(yall) + 1e-12)
+        axins.set_ylim(np.min(yall) - pad, np.max(yall) + pad)
 
-    axins.grid(True, linestyle=":", alpha=0.35)
-    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.3", lw=0.8)
+    if show_zero_ref:
+        axins.axhline(0.0, color="0.3", linestyle="--", linewidth=0.55, alpha=0.8)
 
+    axins.grid(True, linestyle=":", alpha=0.30)
+    axins.legend(frameon=False, fontsize=7, loc=legend_loc)
+
+    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.35", lw=0.8)
+
+def mse_itse_from_window(t: np.ndarray, sig: np.ndarray, plot_range: Tuple[float, float], dt: float) -> Tuple[float, float]:
+    """
+    Compute MSE and ITSE for signal 'sig' over [plot_range[0], plot_range[1]].
+    Error definition: e(t) = sig(t) (ref = 0).
+    Time is re-timed: tp = t - plot_range[0].
+    ITSE = ∫ tp * e(tp)^2 dt ≈ sum(tp * e^2) * dt
+    """
+    mask = (t >= plot_range[0]) & (t <= plot_range[1])
+    if not np.any(mask):
+        return float("nan"), float("nan")
+
+    t0 = float(plot_range[0])
+    tp = t[mask] - t0
+    e = np.asarray(sig, dtype=float)[mask]
+
+    mse = float(np.mean(e ** 2))
+    itse = float(np.sum(tp * (e ** 2)) * dt)
+    return mse, itse
 
 def save_three_figs(
     out_dir: Path,
@@ -227,83 +210,166 @@ def save_three_figs(
     res_lqg: Dict[str, Any],
     plot_range: Tuple[float, float],
     zoom_range: Optional[Tuple[float, float]],
+    u_limit: Optional[float] = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- re-time x-axis ---
     mask = (t >= plot_range[0]) & (t <= plot_range[1])
+    t0 = float(plot_range[0])
+    tp = t[mask] - t0
 
     Yu, Zu, Uu = res_un["Y"], tip_disp(res_un["X"]), res_un["U"]
     Yd, Zd, Ud = res_drl["Y"], tip_disp(res_drl["X"]), res_drl["U"]
     Yp, Zp, Up = res_pid["Y"], tip_disp(res_pid["X"]), res_pid["U"]
     Yg, Zg, Ug = res_lqg["Y"], tip_disp(res_lqg["X"]), res_lqg["U"]
 
-    c_un  = "0.25"
-    c_drl = "#1f77b4"
-    c_pid = "#ff7f0e"
-    c_lqg = "#2ca02c"
+    # Colors
+    c_un  = "0.25"       # gray
+    c_drl = "#1f77b4"    # blue
+    c_pid = "#ff7f0e"    # orange
+    c_lqg = "#d62728"    # red
 
-    # Fig1
+    # linewidths
+    lw_main = 0.9
+    lw_un = 0.55  # uncontrolled thinner
+    lw_inset = 0.65
+
+    # legend font
+    legend_fs = 8
+
+    # Jitter special: control input dense -> half width, and red on top
+    jitter_u_dense = (scenario_key.lower() == "jitter")
+    if jitter_u_dense:
+        lw_u = 0.45  # about half
+    else:
+        lw_u = lw_main
+
+    # ---------------- Fig1: Uncontrolled + DRL-PID + Large Gain PID ----------------
     fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
-    ax1.plot(t[mask], Yu[mask], color=c_un, linestyle="--", alpha=0.75, label="Uncontrolled (PID=0)")
-    ax1.plot(t[mask], Yd[mask], color=c_drl, linestyle="-", alpha=0.95, label="DRL-PID")
-    ax1.set_ylabel("Sensor voltage $y$")
-    ax1.set_title(f"{scenario_key} | Uncontrolled vs DRL-PID", fontweight="bold")
-    ax1.legend(frameon=False, loc="upper right")
 
-    ax2.plot(t[mask], Zu[mask], color=c_un, linestyle="--", alpha=0.75, label="Uncontrolled (PID=0)")
-    ax2.plot(t[mask], Zd[mask], color=c_drl, linestyle="-", alpha=0.95, label="DRL-PID")
+    # Control signal (V)
+    ax1.plot(tp, Yu[mask], color=c_un, linestyle="--", alpha=0.70, linewidth=lw_un, label="Uncontrolled", zorder=1)
+    ax1.plot(tp, Yp[mask], color=c_pid, linestyle="-",  alpha=0.90, linewidth=lw_main, label="Large Gain PID", zorder=2)
+    ax1.plot(tp, Yd[mask], color=c_drl, linestyle="-",  alpha=0.98, linewidth=lw_main, label="DRL-PID", zorder=4)  # blue on top
+    ax1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.7, alpha=0.8)
+    ax1.set_ylabel("Control signal (V)")
+    ax1.set_title(f"{scenario_key} | Uncontrolled vs DRL-PID vs Large Gain PID", fontweight="bold")
+    ax1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
+
+    # Tip displacement (m)
+    ax2.plot(tp, Zu[mask], color=c_un, linestyle="--", alpha=0.70, linewidth=lw_un, label="Uncontrolled", zorder=1)
+    ax2.plot(tp, Zp[mask], color=c_pid, linestyle="-",  alpha=0.90, linewidth=lw_main, label="Large Gain PID", zorder=2)
+    ax2.plot(tp, Zd[mask], color=c_drl, linestyle="-",  alpha=0.98, linewidth=lw_main, label="DRL-PID", zorder=4)  # blue on top
     ax2.set_xlabel("Time (s)")
-    ax2.set_ylabel(r"Tip disp. $z=-2\eta_1+2\eta_2$")
-    ax2.legend(frameon=False, loc="upper right")
+    ax2.set_ylabel("Tip displacement (m)")
+    ax2.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
     if zoom_range is not None:
-        add_inset(ax1, t, Yd, zoom_range)
-        add_inset(ax2, t, Zd, zoom_range)
+        zoom_rel = (zoom_range[0] - t0, zoom_range[1] - t0)
+        add_inset_multi(
+            ax1,
+            series=[
+                (tp, Yd[mask], c_drl, "DRL-PID", lw_inset, 4),
+                (tp, Yp[mask], c_pid, "Large Gain PID", lw_inset, 3),
+            ],
+            zoom_range=zoom_rel,
+            inset_loc="upper right",
+            legend_loc="lower left",
+            show_zero_ref=True
+        )
+        add_inset_multi(
+            ax2,
+            series=[
+                (tp, Zd[mask], c_drl, "DRL-PID", lw_inset, 4),
+                (tp, Zp[mask], c_pid, "Large Gain PID", lw_inset, 3),
+            ],
+            zoom_range=zoom_rel,
+            inset_loc="upper right",
+            legend_loc="lower left",
+            show_zero_ref=False
+        )
 
     fig1.tight_layout()
-    fig1.savefig(out_dir / f"{scenario_key}_fig1_unctrl_vs_drl.pdf", bbox_inches="tight")
+    fig1.savefig(out_dir / f"{scenario_key}_fig1_unctrl_drl_largepid.pdf", bbox_inches="tight")
     plt.close(fig1)
 
-    # Fig2
+    # ---------------- Fig2: DRL-PID + LQG (NO inset as requested) ----------------
     fig2, (bx1, bx2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
-    bx1.plot(t[mask], Yd[mask], color=c_drl, label="DRL-PID")
-    bx1.plot(t[mask], Yp[mask], color=c_pid, label="Large Gain PID")
-    bx1.plot(t[mask], Yg[mask], color=c_lqg, label="LQG")
-    bx1.set_ylabel("Sensor voltage $y$")
-    bx1.set_title(f"{scenario_key} | DRL-PID vs Large Gain PID vs LQG", fontweight="bold")
-    bx1.legend(frameon=False, loc="upper right")
 
-    bx2.plot(t[mask], Zd[mask], color=c_drl, label="DRL-PID")
-    bx2.plot(t[mask], Zp[mask], color=c_pid, label="Large Gain PID")
-    bx2.plot(t[mask], Zg[mask], color=c_lqg, label="LQG")
+    bx1.plot(tp, Yg[mask], color=c_lqg, linewidth=lw_main, alpha=0.92, label="LQG", zorder=2)
+    bx1.plot(tp, Yd[mask], color=c_drl, linewidth=lw_main, alpha=0.98, label="DRL-PID", zorder=4)  # blue on top
+    bx1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.7, alpha=0.8)
+    bx1.set_ylabel("Control signal (V)")
+    bx1.set_title(f"{scenario_key} | DRL-PID vs LQG", fontweight="bold")
+    bx1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
+
+    bx2.plot(tp, Zg[mask], color=c_lqg, linewidth=lw_main, alpha=0.92, label="LQG", zorder=2)
+    bx2.plot(tp, Zd[mask], color=c_drl, linewidth=lw_main, alpha=0.98, label="DRL-PID", zorder=4)
     bx2.set_xlabel("Time (s)")
-    bx2.set_ylabel(r"Tip disp. $z=-2\eta_1+2\eta_2$")
-    bx2.legend(frameon=False, loc="upper right")
-
-    if zoom_range is not None:
-        add_inset(bx1, t, Yd, zoom_range)
-        add_inset(bx2, t, Zd, zoom_range)
+    bx2.set_ylabel("Tip displacement (m)")
+    bx2.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
     fig2.tight_layout()
-    fig2.savefig(out_dir / f"{scenario_key}_fig2_drl_pid_lqg.pdf", bbox_inches="tight")
+    fig2.savefig(out_dir / f"{scenario_key}_fig2_drl_lqg.pdf", bbox_inches="tight")
     plt.close(fig2)
 
-    # Fig3
+    # ---------------- Fig3: Control input (V) with optional saturation lines ----------------
     fig3, cx = plt.subplots(1, 1, figsize=(6.6, 3.3))
-    cx.plot(t[mask], Ud[mask], color=c_drl, label="DRL-PID")
-    cx.plot(t[mask], Up[mask], color=c_pid, label="Large Gain PID")
-    cx.plot(t[mask], Ug[mask], color=c_lqg, label="LQG")
-    cx.set_xlabel("Time (s)")
-    cx.set_ylabel("Control voltage $u$")
-    cx.set_title(f"{scenario_key} | Control input", fontweight="bold")
-    cx.legend(frameon=False, loc="upper right")
 
-    if zoom_range is not None:
-        add_inset(cx, t, Ud, zoom_range)
+    # draw order: for Jitter, red on top; otherwise blue on top (avoid遮挡)
+    if jitter_u_dense:
+        cx.plot(tp, Ud[mask], color=c_drl, linewidth=lw_u, alpha=0.85, label="DRL-PID", zorder=2)
+        cx.plot(tp, Up[mask], color=c_pid, linewidth=lw_u, alpha=0.85, label="Large Gain PID", zorder=3)
+        cx.plot(tp, Ug[mask], color=c_lqg, linewidth=lw_u, alpha=0.95, label="LQG", zorder=5)  # red top
+    else:
+        cx.plot(tp, Ug[mask], color=c_lqg, linewidth=lw_u, alpha=0.90, label="LQG", zorder=2)
+        cx.plot(tp, Up[mask], color=c_pid, linewidth=lw_u, alpha=0.90, label="Large Gain PID", zorder=3)
+        cx.plot(tp, Ud[mask], color=c_drl, linewidth=lw_u, alpha=0.98, label="DRL-PID", zorder=5)  # blue top
+
+    cx.set_xlabel("Time (s)")
+    cx.set_ylabel("Control input (V)")
+    cx.set_title(f"{scenario_key} | Control input", fontweight="bold")
+    cx.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
     fig3.tight_layout()
     fig3.savefig(out_dir / f"{scenario_key}_fig3_u_compare.pdf", bbox_inches="tight")
     plt.close(fig3)
+
+    # ---------------- Fig4: DRL-PID gains (Kp, Ki, Kd) on one axis ----------------
+    ctrl = res_drl.get("controller", {})
+    kp_all = ctrl.get("kp", None)
+    ki_all = ctrl.get("ki", None)
+    kd_all = ctrl.get("kd", None)
+
+    if kp_all is not None and ki_all is not None and kd_all is not None:
+        # tp 对应 mask 后的时间轴；kp_all[mask] 对应同一段数据
+        tp_full = tp
+        kp_seg = kp_all[mask]
+        ki_seg = ki_all[mask]
+        kd_seg = kd_all[mask]
+
+        # Thermal/Mixed：只画 tp 开始后 10s
+        if scenario_key.lower() in ["thermal", "mixed"]:
+            pid_mask = (tp_full <= 10.0)
+        else:
+            pid_mask = np.ones_like(tp_full, dtype=bool)
+
+        fig4, ax = plt.subplots(1, 1, figsize=(6.6, 3.3))
+
+        # 三条线不同颜色（不和前面控制器颜色冲突）
+        ax.plot(tp_full[pid_mask], kp_seg[pid_mask], linewidth=0.7, label=r"$K_p$")
+        ax.plot(tp_full[pid_mask], ki_seg[pid_mask], linewidth=0.7, label=r"$K_i$")
+        ax.plot(tp_full[pid_mask], kd_seg[pid_mask], linewidth=0.7, label=r"$K_d$")
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("PID gains")
+        ax.set_title(f"{scenario_key} | DRL-PID gains", fontweight="bold")
+        ax.legend(frameon=False, fontsize=8, loc="upper right")
+
+        fig4.tight_layout()
+        fig4.savefig(out_dir / f"{scenario_key}_fig4_drl_pid_gains.pdf", bbox_inches="tight")
+        plt.close(fig4)
 
 
 # ============================================================
@@ -325,7 +391,7 @@ def main():
     # Agent
     agent = DDPGAgent(conf)
 
-    model_rel = r"models\ddpg_ep_100.pth"
+    model_rel = r"models\ddpg_ep_63.pth"
     model_path = os.path.join(project_root, model_rel)
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
@@ -335,9 +401,9 @@ def main():
 
     # thermal data
     try:
-        mt_loaded = load_mat()
+        _ = load_mat()
     except Exception:
-        mt_loaded = None
+        pass
 
     # projector
     proj = BeamDisturbanceProjector(L=5.0, n_modes=4)
@@ -346,13 +412,13 @@ def main():
     out_dir = Path(project_root) / "results" / "baseline_pid_lqg_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # exactly 5 scenarios
+    # keep your modified plot ranges / zoom ranges
     scenarios = {
         "Jitter":   {"noise_option": "jitter",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
-        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 100.0), "zoom_range": (60.0, 70.0)},
-        "Impact":   {"noise_option": "impact",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (5.0, 30.0),  "zoom_range": (5.0, 15.0)},
-        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (10.0, 30.0), "zoom_range": None},
-        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 100.0), "zoom_range": (60.0, 70.0)},
+        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0), "zoom_range": (65.0, 70.0)},
+        "Impact":   {"noise_option": "impact",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (5.0, 15.0),  "zoom_range": None},
+        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (18.0, 23.0), "zoom_range": None},
+        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0), "zoom_range": (65.0, 70.0)},
     }
 
     # LQG hyperparameters
@@ -361,7 +427,7 @@ def main():
     W_kf = np.diag([1e-6, 1e-6, 1e-3, 1e-3])
     V_kf = np.array([[1e-4]])
 
-    # thermal vector extraction (match your original evaluation)
+    # thermal vector extraction
     thermal_vector = None
     raw_thermal = getattr(conf, "THERMAL_MOMENT", None)
     if raw_thermal is not None:
@@ -370,19 +436,19 @@ def main():
         else:
             thermal_vector = np.array(raw_thermal).flatten()
 
+    U_LIMIT = 300.0
+
     for scen_name, cfg in scenarios.items():
         noise_opt = cfg["noise_option"]
         fixed_pid = cfg["fixed_pid"]
         plot_range = cfg["plot_range"]
         zoom_range = cfg["zoom_range"]
 
-        # per-scenario deterministic seed
-        scen_seed = (SEED + (abs(hash(scen_name)) % 100000)) % (2**32 - 1)
+        scen_seed = (SEED + zlib.crc32(scen_name.encode("utf-8")) % 100000) % (2**32 - 1)
         np.random.seed(scen_seed)
         random.seed(scen_seed)
         torch.manual_seed(scen_seed)
 
-        # mt_input only for thermal/mixed
         mt_input = None
         if noise_opt in ["thermal", "mixed"] and thermal_vector is not None:
             if len(thermal_vector) >= tn:
@@ -402,29 +468,33 @@ def main():
         sim = StateSpaceSimulator(
             system_config=conf.SYSTEM_CONFIG,
             noise_term=noise_data,
-            sim_cfg=SimConfig(dt=dt, tn=tn, u_limit=None, meas_noise_std=0.0)
+            sim_cfg=SimConfig(dt=dt, tn=tn, u_limit=U_LIMIT, meas_noise_std=0.0)
         )
 
-        # controllers
         ctrl_un = make_fixed_pid_controller(conf.SYSTEM_CONFIG, kp=0.0, ki=0.0, kd=0.0)
-
         ctrl_drl = DRLPIDControllerWithC(agent=agent, conf=conf, episode_length=tn, C=sim.C)
-
         ctrl_pid = make_fixed_pid_controller(conf.SYSTEM_CONFIG, kp=fixed_pid[0], ki=fixed_pid[1], kd=fixed_pid[2])
+        ctrl_lqg = make_lqg_controller(conf.SYSTEM_CONFIG, dt=dt, Q_lqr=Q_lqr, R_lqr=R_lqr, W_kf=W_kf, V_kf=V_kf)
 
-        ctrl_lqg = make_lqg_controller(
-            conf.SYSTEM_CONFIG, dt=dt,
-            Q_lqr=Q_lqr, R_lqr=R_lqr,
-            W_kf=W_kf, V_kf=V_kf
-        )
-
-        # run (same noise_data)
         res_un = sim.run(ctrl_un)
         res_drl = sim.run(ctrl_drl)
         res_pid = sim.run(ctrl_pid)
         res_lqg = sim.run(ctrl_lqg)
 
-        # save figs (vector PDF)
+        # ---------------- Metrics: MSE / ITSE (based on control signal Y, ref=0) ----------------
+        t = res_un["t"]
+
+        mse_un,  itse_un  = mse_itse_from_window(t, res_un["Y"],  plot_range, dt)
+        mse_drl, itse_drl = mse_itse_from_window(t, res_drl["Y"], plot_range, dt)
+        mse_pid, itse_pid = mse_itse_from_window(t, res_pid["Y"], plot_range, dt)
+        mse_lqg, itse_lqg = mse_itse_from_window(t, res_lqg["Y"], plot_range, dt)
+
+        print(f"\n[{scen_name}] Metrics on Control signal Y (window {plot_range[0]}–{plot_range[1]} s, retimed tp):")
+        print(f"  Uncontrolled   : MSE={mse_un:.6e} | ITSE={itse_un:.6e}")
+        print(f"  DRL-PID        : MSE={mse_drl:.6e} | ITSE={itse_drl:.6e}")
+        print(f"  Large Gain PID : MSE={mse_pid:.6e} | ITSE={itse_pid:.6e}")
+        print(f"  LQG            : MSE={mse_lqg:.6e} | ITSE={itse_lqg:.6e}")
+
         t = res_un["t"]
         save_three_figs(
             out_dir=out_dir,
@@ -435,7 +505,8 @@ def main():
             res_pid=res_pid,
             res_lqg=res_lqg,
             plot_range=plot_range,
-            zoom_range=zoom_range
+            zoom_range=zoom_range,
+            u_limit=U_LIMIT
         )
         print(f"[OK] {scen_name} -> {out_dir}")
 

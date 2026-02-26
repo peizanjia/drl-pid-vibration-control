@@ -21,8 +21,10 @@ class Config:
 
     # PID参数范围（归一化前）
     KP_RANGE = [0.0, 200.0]
-    KI_RANGE = [0.0, 20.0]
+    KI_RANGE = [0.0, 30.0]
     KD_RANGE = [20.0, 30.0]
+
+    U_LIMIT = 300.0
 
     # 网络参数
     HIDDEN_DIM = 128

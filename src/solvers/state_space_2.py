@@ -49,6 +49,8 @@ class StateSpace:
         self.ki_history = np.zeros(tn)
         self.kd_history = np.zeros(tn)
 
+        self.u_history = np.zeros(tn)
+
     def set_external_controller(self, controller_callback):
         """
         设置外部控制器回调函数
@@ -129,6 +131,7 @@ class StateSpace:
             self.ed = (self.C @ Xd_col)
 
             self.u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed  # u 是标量
+            self.u_history[i] = (self.u).item()
 
             # --- 4. 与外部神经网络控制器交互 ---
             if self.external_controller_callback is not None:
@@ -161,6 +164,8 @@ class StateSpace:
         self.ki_history[-1] = self.ki
         self.kd_history[-1] = self.kd
 
+        self.u_history[-1] = self.u_history[-2]
+
     def plot_time_domain_response(self):
         """
         绘制位移与传感器电压的时间响应曲线。
@@ -176,22 +181,29 @@ class StateSpace:
         # 3. 创建画布：增加 dpi 提升清晰度，预设学术风格
         plt.rcParams['font.sans-serif'] = ['SimHei']  # 解决中文显示问题
         plt.rcParams['axes.unicode_minus'] = False
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-        # -------- 子图 1：动力学状态 --------
+        # 子图 1：动力学状态
         ax1.plot(time_vector, z, color='#1f77b4', linewidth=1.5, label=r'$z = -2X_0 + 2X_1$')
         ax1.set_ylabel('位移 (m)', fontsize=12)
         ax1.set_title('端部动力学响应 (真实值)', fontsize=14, fontweight='bold')
         ax1.legend(loc='upper right')
         ax1.grid(True, linestyle=':', alpha=0.7)
 
-        # -------- 子图 2：传感器输出 --------
+        # 子图 2：传感器输出
         ax2.plot(time_vector, self.Y.flatten(), color='#d62728', linewidth=1.5, label='Sensor Output')
-        ax2.set_xlabel('时间 (s)', fontsize=12)
         ax2.set_ylabel('电压 (V)', fontsize=12)
         ax2.set_title('传感器实测电压信号', fontsize=14, fontweight='bold')
         ax2.legend(loc='upper right')
         ax2.grid(True, linestyle=':', alpha=0.7)
+
+        # === 新增：子图 3：控制输入 u ===
+        ax3.plot(time_vector, self.u_history.flatten(), color='#2ca02c', linewidth=1.5, label='Control Input $u(t)$')
+        ax3.set_xlabel('时间 (s)', fontsize=12)
+        ax3.set_ylabel('u', fontsize=12)  # 如果u有物理量纲（电压/力），这里改成对应单位
+        ax3.set_title('控制输入时间历程', fontsize=14, fontweight='bold')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, linestyle=':', alpha=0.7)
 
         # 4. 细节微调
         plt.tight_layout()  # 自动处理子图间距，防止标签重叠
@@ -239,7 +251,7 @@ if __name__ == '__main__':
         dt=config.DT,
         tn=tn,
         kp=100,
-        ki=5,
+        ki=50,
         kd=25
     )
 
