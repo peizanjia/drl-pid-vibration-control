@@ -12,7 +12,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 #
 # PID:
 # e  = C X
-# ei = ∫ e dt  (discrete accumulation)
+# ei = integral of e dt (discrete accumulation)
 # ed = C Xd    where Xd = A X + B u + F
 # u  = kp*e - ki*ei - kd*ed
 #
@@ -167,26 +167,24 @@ class StateSpace:
         time_vector = np.arange(N) * self.dt
         z = -2 * self.X[0, :] + 2 * self.X[1, :]
 
-        plt.rcParams["font.sans-serif"] = ["SimHei"]
-        plt.rcParams["axes.unicode_minus"] = False
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
         ax1.plot(time_vector, z, linewidth=1.5, label=r"$z = -2X_0 + 2X_1$")
-        ax1.set_ylabel("位移 (m)", fontsize=12)
-        ax1.set_title("端部动力学响应 (真实值)", fontsize=14, fontweight="bold")
+        ax1.set_ylabel("Displacement (m)", fontsize=12)
+        ax1.set_title("Tip Dynamics Response", fontsize=14, fontweight="bold")
         ax1.legend(loc="upper right")
         ax1.grid(True, linestyle=":", alpha=0.7)
 
         ax2.plot(time_vector, self.Y.flatten(), linewidth=1.5, label="Sensor Output")
-        ax2.set_ylabel("电压 (V)", fontsize=12)
-        ax2.set_title("传感器实测电压信号", fontsize=14, fontweight="bold")
+        ax2.set_ylabel("Voltage (V)", fontsize=12)
+        ax2.set_title("Measured Sensor Signal", fontsize=14, fontweight="bold")
         ax2.legend(loc="upper right")
         ax2.grid(True, linestyle=":", alpha=0.7)
 
         ax3.plot(time_vector, self.u_history.flatten(), linewidth=1.5, label="Control Input $u(t)$")
-        ax3.set_xlabel("时间 (s)", fontsize=12)
+        ax3.set_xlabel("Time (s)", fontsize=12)
         ax3.set_ylabel("u", fontsize=12)
-        ax3.set_title("控制输入时间历程", fontsize=14, fontweight="bold")
+        ax3.set_title("Control Input History", fontsize=14, fontweight="bold")
         ax3.legend(loc="upper right")
         ax3.grid(True, linestyle=":", alpha=0.7)
 
@@ -208,6 +206,7 @@ _G_YDOT_W = None
 _G_FAIL = None
 _G_UCLIP = None
 
+
 def _worker_init(config_system, noise_data_list, dt, tn, ydot_weight, fail_penalty, u_clip):
     global _G_CONFIG_SYSTEM, _G_NOISE_LIST, _G_DT, _G_TN, _G_YDOT_W, _G_FAIL, _G_UCLIP
     _G_CONFIG_SYSTEM = config_system
@@ -218,10 +217,11 @@ def _worker_init(config_system, noise_data_list, dt, tn, ydot_weight, fail_penal
     _G_FAIL = float(fail_penalty)
     _G_UCLIP = u_clip
 
+
 def _eval_one_particle(pid_params):
     """
     Evaluate one particle (kp, ki, kd):
-    objective = mean over 5 envs of ∫ (y^2 + 10*y'^2) dt
+    objective = mean over 5 envs of integral(y^2 + 10*y'^2) dt
     where y' = C Xdot = C Xd (STRICTLY from state-space)
     """
     kp, ki, kd = pid_params
@@ -290,7 +290,7 @@ class PSO_PID:
         ydot_weight=10.0,
         fail_penalty=1e18,
         u_clip=None,
-        n_workers=14,      # <<< NEW: 14 cores parallel
+        n_workers=14,      # 14 cores parallel
         mp_start_method=None,  # None -> choose automatically; or "spawn"/"fork"
     ):
         self.config_system = config_system
@@ -433,7 +433,7 @@ if __name__ == "__main__":
     proj = BeamDisturbanceProjector()
     projector_coeffs = proj.get_static_coeffs()
 
-    # 4) build 5 environments (EDIT to match your create_noise_data options)
+    # 4) build 5 environments (edit to match your create_noise_data options)
     env_options = ["impact", "thermal", "jitter", "maneuver", "mixed"]
     env_seeds = [101, 102, 103, 104, 105]
 
@@ -471,7 +471,7 @@ if __name__ == "__main__":
         mp_start_method=None,  # None->spawn; if Linux and want speed: "fork"
     )
 
-    print("Running PSO (14-core parallel): objective = mean_{5 env} ∫(y^2 + 10 y'^2) dt ...")
+    print("Running PSO (14-core parallel): objective = mean_{5 env} integral(y^2 + 10 y'^2) dt ...")
     best_pid, best_J = pso.run(verbose=True)
     best_kp, best_ki, best_kd = best_pid
 

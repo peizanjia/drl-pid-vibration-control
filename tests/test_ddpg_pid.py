@@ -153,7 +153,7 @@ def add_inset_multi(
 ):
     """
     series: list of (t, y, color, label, linewidth, zorder)
-    inset 内线条更细，并带 legend
+    inset lines are thinner and include a legend
     """
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 
@@ -186,7 +186,7 @@ def mse_itse_from_window(t: np.ndarray, sig: np.ndarray, plot_range: Tuple[float
     Compute MSE and ITSE for signal 'sig' over [plot_range[0], plot_range[1]].
     Error definition: e(t) = sig(t) (ref = 0).
     Time is re-timed: tp = t - plot_range[0].
-    ITSE = ∫ tp * e(tp)^2 dt ≈ sum(tp * e^2) * dt
+    ITSE = integral(tp * e(tp)^2) dt ~= sum(tp * e^2) * dt
     """
     mask = (t >= plot_range[0]) & (t <= plot_range[1])
     if not np.any(mask):
@@ -224,140 +224,126 @@ def save_three_figs(
     Yp, Zp, Up = res_pid["Y"], tip_disp(res_pid["X"]), res_pid["U"]
     Yg, Zg, Ug = res_lqg["Y"], tip_disp(res_lqg["X"]), res_lqg["U"]
 
-    # Colors
-    c_un  = "0.25"       # gray
-    c_drl = "#1f77b4"    # blue
-    c_pid = "#ff7f0e"    # orange
-    c_lqg = "#d62728"    # red
+    # colors
+    c_un  = "0.3"
+    c_drl = "#1f77b4"
+    c_pid = "#ff7f0e"
+    c_lqg = "#d62728"
 
-    # linewidths
-    lw_main = 0.9
-    lw_un = 0.55  # uncontrolled thinner
-    lw_inset = 0.65
+    # thinner lines
+    lw = 0.6
+    lw_un = 0.45
 
-    # legend font
     legend_fs = 8
 
-    # Jitter special: control input dense -> half width, and red on top
-    jitter_u_dense = (scenario_key.lower() == "jitter")
-    if jitter_u_dense:
-        lw_u = 0.45  # about half
-    else:
-        lw_u = lw_main
+    # =========================================================
+    # Fig1: Vibration + Tip displacement (4 controllers)
+    # =========================================================
 
-    # ---------------- Fig1: Uncontrolled + DRL-PID + Large Gain PID ----------------
     fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
 
-    # Control signal (V)
-    ax1.plot(tp, Yu[mask], color=c_un, linestyle="--", alpha=0.70, linewidth=lw_un, label="Uncontrolled", zorder=1)
-    ax1.plot(tp, Yp[mask], color=c_pid, linestyle="-",  alpha=0.90, linewidth=lw_main, label="Large Gain PID", zorder=2)
-    ax1.plot(tp, Yd[mask], color=c_drl, linestyle="-",  alpha=0.98, linewidth=lw_main, label="DRL-PID", zorder=4)  # blue on top
-    ax1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.7, alpha=0.8)
-    ax1.set_ylabel("Control signal (V)")
-    ax1.set_title(f"{scenario_key} | Uncontrolled vs DRL-PID vs Large Gain PID", fontweight="bold")
+    # vibration signal
+    ax1.plot(tp, Yu[mask], color=c_un, linestyle=":", linewidth=lw_un, label="Uncontrolled", zorder=1)
+    ax1.plot(tp, Yp[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    ax1.plot(tp, Yg[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
+    ax1.plot(tp, Yd[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
+
+    ax1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.6)
+
+    ax1.set_ylabel("Vibration signal (V)")
+    ax1.set_title(f"{scenario_key} | Controller comparison", fontweight="bold")
     ax1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
-    # Tip displacement (m)
-    ax2.plot(tp, Zu[mask], color=c_un, linestyle="--", alpha=0.70, linewidth=lw_un, label="Uncontrolled", zorder=1)
-    ax2.plot(tp, Zp[mask], color=c_pid, linestyle="-",  alpha=0.90, linewidth=lw_main, label="Large Gain PID", zorder=2)
-    ax2.plot(tp, Zd[mask], color=c_drl, linestyle="-",  alpha=0.98, linewidth=lw_main, label="DRL-PID", zorder=4)  # blue on top
+    # tip displacement
+    ax2.plot(tp, Zu[mask], color=c_un, linestyle=":", linewidth=lw_un, label="Uncontrolled", zorder=1)
+    ax2.plot(tp, Zp[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    ax2.plot(tp, Zg[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
+    ax2.plot(tp, Zd[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
+
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Tip displacement (m)")
     ax2.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
-    if zoom_range is not None:
-        zoom_rel = (zoom_range[0] - t0, zoom_range[1] - t0)
-        add_inset_multi(
-            ax1,
-            series=[
-                (tp, Yd[mask], c_drl, "DRL-PID", lw_inset, 4),
-                (tp, Yp[mask], c_pid, "Large Gain PID", lw_inset, 3),
-            ],
-            zoom_range=zoom_rel,
-            inset_loc="upper right",
-            legend_loc="lower left",
-            show_zero_ref=True
-        )
-        add_inset_multi(
-            ax2,
-            series=[
-                (tp, Zd[mask], c_drl, "DRL-PID", lw_inset, 4),
-                (tp, Zp[mask], c_pid, "Large Gain PID", lw_inset, 3),
-            ],
-            zoom_range=zoom_rel,
-            inset_loc="upper right",
-            legend_loc="lower left",
-            show_zero_ref=False
-        )
+    # ---------------- inset for thermal / mixed ----------------
+    if scenario_key.lower() in ["thermal", "mixed"]:
+
+        zoom_len = 5.0
+        zoom_start = tp[-1] - zoom_len
+        zoom_end = tp[-1]
+
+        inset = ax1.inset_axes([0.62, 0.55, 0.33, 0.33])
+
+        zoom_mask = (tp >= zoom_start) & (tp <= zoom_end)
+
+        inset.plot(tp[zoom_mask], Yp[mask][zoom_mask],
+                   color=c_pid, linestyle="--", linewidth=0.6, label="Large Gain PID")
+
+        inset.plot(tp[zoom_mask], Yd[mask][zoom_mask],
+                   color=c_drl, linestyle="-", linewidth=0.6, label="DRL-PID")
+
+        inset.axhline(0.0, color="0.3", linestyle="--", linewidth=0.5)
+
+        inset.set_xlim(zoom_start, zoom_end)
+
+        # auto y-range
+        y_zoom = np.concatenate([
+            Yp[mask][zoom_mask],
+            Yd[mask][zoom_mask]
+        ])
+        pad = 0.1 * np.max(np.abs(y_zoom)) if np.max(np.abs(y_zoom)) > 0 else 1e-4
+        inset.set_ylim(y_zoom.min()-pad, y_zoom.max()+pad)
+
+        inset.tick_params(labelsize=6)
+
+        ax1.indicate_inset_zoom(inset, edgecolor="0.3")
 
     fig1.tight_layout()
-    fig1.savefig(out_dir / f"{scenario_key}_fig1_unctrl_drl_largepid.pdf", bbox_inches="tight")
+    fig1.savefig(out_dir / f"{scenario_key}_fig1_all_controller_compare.pdf", bbox_inches="tight")
     plt.close(fig1)
 
-    # ---------------- Fig2: DRL-PID + LQG (NO inset as requested) ----------------
-    fig2, (bx1, bx2) = plt.subplots(2, 1, figsize=(6.6, 5.4), sharex=True)
+    # =========================================================
+    # Fig2: Control input
+    # =========================================================
 
-    bx1.plot(tp, Yg[mask], color=c_lqg, linewidth=lw_main, alpha=0.92, label="LQG", zorder=2)
-    bx1.plot(tp, Yd[mask], color=c_drl, linewidth=lw_main, alpha=0.98, label="DRL-PID", zorder=4)  # blue on top
-    bx1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.7, alpha=0.8)
-    bx1.set_ylabel("Control signal (V)")
-    bx1.set_title(f"{scenario_key} | DRL-PID vs LQG", fontweight="bold")
-    bx1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
+    fig2, cx = plt.subplots(1, 1, figsize=(6.6, 3.3))
 
-    bx2.plot(tp, Zg[mask], color=c_lqg, linewidth=lw_main, alpha=0.92, label="LQG", zorder=2)
-    bx2.plot(tp, Zd[mask], color=c_drl, linewidth=lw_main, alpha=0.98, label="DRL-PID", zorder=4)
-    bx2.set_xlabel("Time (s)")
-    bx2.set_ylabel("Tip displacement (m)")
-    bx2.legend(frameon=False, loc="upper left", fontsize=legend_fs)
-
-    fig2.tight_layout()
-    fig2.savefig(out_dir / f"{scenario_key}_fig2_drl_lqg.pdf", bbox_inches="tight")
-    plt.close(fig2)
-
-    # ---------------- Fig3: Control input (V) with optional saturation lines ----------------
-    fig3, cx = plt.subplots(1, 1, figsize=(6.6, 3.3))
-
-    # draw order: for Jitter, red on top; otherwise blue on top (avoid遮挡)
-    if jitter_u_dense:
-        cx.plot(tp, Ud[mask], color=c_drl, linewidth=lw_u, alpha=0.85, label="DRL-PID", zorder=2)
-        cx.plot(tp, Up[mask], color=c_pid, linewidth=lw_u, alpha=0.85, label="Large Gain PID", zorder=3)
-        cx.plot(tp, Ug[mask], color=c_lqg, linewidth=lw_u, alpha=0.95, label="LQG", zorder=5)  # red top
-    else:
-        cx.plot(tp, Ug[mask], color=c_lqg, linewidth=lw_u, alpha=0.90, label="LQG", zorder=2)
-        cx.plot(tp, Up[mask], color=c_pid, linewidth=lw_u, alpha=0.90, label="Large Gain PID", zorder=3)
-        cx.plot(tp, Ud[mask], color=c_drl, linewidth=lw_u, alpha=0.98, label="DRL-PID", zorder=5)  # blue top
+    cx.plot(tp, Up[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    cx.plot(tp, Ug[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
+    cx.plot(tp, Ud[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
 
     cx.set_xlabel("Time (s)")
     cx.set_ylabel("Control input (V)")
     cx.set_title(f"{scenario_key} | Control input", fontweight="bold")
     cx.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
-    fig3.tight_layout()
-    fig3.savefig(out_dir / f"{scenario_key}_fig3_u_compare.pdf", bbox_inches="tight")
-    plt.close(fig3)
+    fig2.tight_layout()
+    fig2.savefig(out_dir / f"{scenario_key}_fig2_control_input.pdf", bbox_inches="tight")
+    plt.close(fig2)
 
-    # ---------------- Fig4: DRL-PID gains (Kp, Ki, Kd) on one axis ----------------
+    # =========================================================
+    # Fig3: DRL-PID gains
+    # =========================================================
+
     ctrl = res_drl.get("controller", {})
     kp_all = ctrl.get("kp", None)
     ki_all = ctrl.get("ki", None)
     kd_all = ctrl.get("kd", None)
 
     if kp_all is not None and ki_all is not None and kd_all is not None:
-        # tp 对应 mask 后的时间轴；kp_all[mask] 对应同一段数据
-        tp_full = tp
+
         kp_seg = kp_all[mask]
         ki_seg = ki_all[mask]
         kd_seg = kd_all[mask]
 
-        # Thermal/Mixed：只画 tp 开始后 10s
+        tp_full = tp
+
         if scenario_key.lower() in ["thermal", "mixed"]:
             pid_mask = (tp_full <= 10.0)
         else:
             pid_mask = np.ones_like(tp_full, dtype=bool)
 
-        fig4, ax = plt.subplots(1, 1, figsize=(6.6, 3.3))
+        fig3, ax = plt.subplots(1, 1, figsize=(6.6, 3.3))
 
-        # 三条线不同颜色（不和前面控制器颜色冲突）
         ax.plot(tp_full[pid_mask], kp_seg[pid_mask], linewidth=0.7, label=r"$K_p$")
         ax.plot(tp_full[pid_mask], ki_seg[pid_mask], linewidth=0.7, label=r"$K_i$")
         ax.plot(tp_full[pid_mask], kd_seg[pid_mask], linewidth=0.7, label=r"$K_d$")
@@ -365,11 +351,11 @@ def save_three_figs(
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("PID gains")
         ax.set_title(f"{scenario_key} | DRL-PID gains", fontweight="bold")
-        ax.legend(frameon=False, fontsize=8, loc="upper right")
+        ax.legend(frameon=False, fontsize=8)
 
-        fig4.tight_layout()
-        fig4.savefig(out_dir / f"{scenario_key}_fig4_drl_pid_gains.pdf", bbox_inches="tight")
-        plt.close(fig4)
+        fig3.tight_layout()
+        fig3.savefig(out_dir / f"{scenario_key}_fig3_drl_pid_gains.pdf", bbox_inches="tight")
+        plt.close(fig3)
 
 
 # ============================================================
@@ -481,7 +467,7 @@ def main():
         res_pid = sim.run(ctrl_pid)
         res_lqg = sim.run(ctrl_lqg)
 
-        # ---------------- Metrics: MSE / ITSE (based on control signal Y, ref=0) ----------------
+        # ---------------- Metrics: MSE / ITSE (based on Vibration signal Y, ref=0) ----------------
         t = res_un["t"]
 
         mse_un,  itse_un  = mse_itse_from_window(t, res_un["Y"],  plot_range, dt)
@@ -489,7 +475,7 @@ def main():
         mse_pid, itse_pid = mse_itse_from_window(t, res_pid["Y"], plot_range, dt)
         mse_lqg, itse_lqg = mse_itse_from_window(t, res_lqg["Y"], plot_range, dt)
 
-        print(f"\n[{scen_name}] Metrics on Control signal Y (window {plot_range[0]}–{plot_range[1]} s, retimed tp):")
+        print(f"\n[{scen_name}] Metrics on Vibration signal Y (window {plot_range[0]}-{plot_range[1]} s, retimed tp):")
         print(f"  Uncontrolled   : MSE={mse_un:.6e} | ITSE={itse_un:.6e}")
         print(f"  DRL-PID        : MSE={mse_drl:.6e} | ITSE={itse_drl:.6e}")
         print(f"  Large Gain PID : MSE={mse_pid:.6e} | ITSE={itse_pid:.6e}")

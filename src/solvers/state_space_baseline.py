@@ -361,7 +361,7 @@ class StateSpaceSimulator:
 
         # controller-specific history init
         if hasattr(controller, "setup_history"):
-            # FixedPIDController / LQGController / 你自定义 DRL-PID 都可以实现这个方法
+            # FixedPIDController / LQGController / custom DRL-PID can implement this method
             try:
                 controller.setup_history(tn)
             except TypeError:
@@ -370,7 +370,7 @@ class StateSpaceSimulator:
         if hasattr(controller, "set_xhat0") and xhat0 is not None:
             controller.set_xhat0(xhat0)
 
-        # 关键：u_old = 上一步 u。与 env 一致：初始 u(-1)=0
+        # Key: u_old is the previous u. Env-consistent: initial u(-1)=0
         u_old = 0.0
 
         for i in range(tn - 1):
@@ -393,10 +393,10 @@ class StateSpaceSimulator:
             Xd[:, i] = Xd_col.reshape(-1)
 
             # --- 4) controller computes u_new using current signals ---
-            # 注意：这里把 u_prev 的语义交给 controller（DRL-PID 会用它构造 state）
+            # Note: u_prev semantics are handled by the controller (DRL-PID uses it for state)
             u_new_cmd = controller.compute(
                 x=X[:, i].copy(),
-                xdot=Xd[:, i].copy(),  # 这是基于 u_old 的 xdot，与 env 的 ed 计算一致
+                xdot=Xd[:, i].copy(),  # xdot is based on u_old, consistent with env ed
                 y=y_now,
                 dt=dt,
                 t=t
@@ -404,7 +404,7 @@ class StateSpaceSimulator:
             u_new = self._sat(u_new_cmd)
             U[i] = u_new
 
-            # 控制器日志（支持 FixedPIDController / 你自定义 DRL-PID）
+            # Controller logging (FixedPIDController / custom DRL-PID)
             if hasattr(controller, "log_step"):
                 controller.log_step(i)
 
@@ -429,7 +429,7 @@ class StateSpaceSimulator:
                 y_next = y_next + np.random.randn() * self.sim_cfg.meas_noise_std
             Y[i + 1] = y_next
 
-            # LQG estimator update uses y_{i+1} (与你之前的实现一致)
+            # LQG estimator update uses y_{i+1} (consistent with previous implementation)
             if hasattr(controller, "kalman_update_with_measurement"):
                 controller.kalman_update_with_measurement(u=u_new, y_meas=y_next, i=i + 1)
 

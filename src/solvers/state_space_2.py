@@ -3,9 +3,10 @@ import matplotlib.pyplot as plt
 import os
 
 
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
-# X'(t) = AX(t) + Bu(t) + F(t)
-# Y(t) = CX(t)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+# X'(t) = A X(t) + B u(t) + F(t)
+# Y(t) = C X(t)
+
 
 class StateSpace:
 
@@ -18,33 +19,33 @@ class StateSpace:
         self.Reference = np.zeros(tn)
         self.current_step = 0
 
-        # PID参数 - 初始值
+        # PID gains (initial)
         self.kp = kp
         self.ki = ki
         self.kd = kd
 
-        # PID状态变量
+        # PID internal states
         self.e = 0
         self.ei = 0
         self.ed = 0
 
-        # 状态和输出数组
+        # State and output arrays
         self.X = np.zeros((4, tn))
         self.Xd = np.zeros((4, tn))
         self.Y = np.zeros(tn)
         self.u = 0
 
-        # 噪声项
+        # Disturbance terms
         self.F1 = self.noise_term['F1']
         self.F2 = self.noise_term['F2']
 
-        # 系统矩阵
+        # System matrices
         self.A, self.B, self.C = self.assemble_mat()
 
-        # 外部控制器回调函数 - 初始为None，需要在solve前设置
+        # External controller callback (set before solve if needed)
         self.external_controller_callback = None
 
-        # 存储每个时间步的PID参数用于分析
+        # History of PID gains for analysis
         self.kp_history = np.zeros(tn)
         self.ki_history = np.zeros(tn)
         self.kd_history = np.zeros(tn)
@@ -53,10 +54,10 @@ class StateSpace:
 
     def set_external_controller(self, controller_callback):
         """
-        设置外部控制器回调函数
+        Register an external controller callback.
 
         Args:
-            controller_callback: 函数，接受(Y, time)作为输入，返回(kp, ki, kd)
+            controller_callback: function(Y, time) -> (kp, ki, kd)
         """
         self.external_controller_callback = controller_callback
 
@@ -90,63 +91,59 @@ class StateSpace:
         return F
 
     def solve(self):
-        # 确保矩阵形状正确
+        # Ensure correct B shape
         if self.B.ndim == 1 or self.B.shape != (4, 1):
             self.B = self.B.reshape(4, 1)
 
-        # 检查是否设置了外部控制器
+        # If no external controller, use fixed PID gains
         if self.external_controller_callback is None:
-            print("警告: 未设置外部控制器，将使用固定PID参数")
+            print("Warning: no external controller set. Using fixed PID gains.")
 
         for i in range(self.tn - 1):
             self.current_step = i
-            # 存储当前PID参数
+            # Record PID gains
             self.kp_history[i] = self.kp
             self.ki_history[i] = self.ki
             self.kd_history[i] = self.kd
 
-            # 0. 关键：将当前状态 X[:, i] 转换为 (4, 1) 列向量
-            X_col = self.X[:, i].reshape(4, 1)  # 转换为 (4, 1)
+            # Convert X[:, i] to a (4, 1) column vector
+            X_col = self.X[:, i].reshape(4, 1)
 
-            # --- 1. 噪声计算与修正 ---
+            # --- 1) Disturbance terms ---
             F1 = self.compute_noise(i)
             F2 = self.compute_noise(i + 1)
 
-            # 确保 F1 和 F2 是 (4, 1)
+            # Ensure F1/F2 are (4,1)
             if F1.ndim == 1 or F1.shape != (4, 1):
                 F1 = F1.reshape(4, 1)
             if F2.ndim == 1 or F2.shape != (4, 1):
                 F2 = F2.reshape(4, 1)
 
-            # --- 2. 目标 Xd 赋值 ---
+            # --- 2) Xdot ---
             Xd_col = self.A @ X_col + self.B * self.u + F1
             self.Xd[:, i] = Xd_col.reshape(-1)
 
-            # --- 3. PID 计算 ---
-            # self.e = -2 * X_col[0] + 2 * X_col[1]
-            # self.ei += (-2 * X_col[0] + 2 * X_col[1]) * self.dt
-            # self.ed = -2 * X_col[2] + 2 * X_col[3]
+            # --- 3) PID update ---
             self.e = (self.C @ X_col)
             self.ei += (self.e * self.dt)
             self.ed = (self.C @ Xd_col)
 
-            self.u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed  # u 是标量
+            self.u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed
             self.u_history[i] = (self.u).item()
 
-            # --- 4. 与外部神经网络控制器交互 ---
+            # --- 4) External controller hook ---
             if self.external_controller_callback is not None:
                 current_time = i * self.dt
                 current_output = self.Y[i]
 
-                # 调用外部控制器获取新的PID参数
                 new_kp, new_ki, new_kd = self.external_controller_callback(current_output, current_time)
 
-                # 更新PID参数（用于下一个时间步）
+                # Update gains for next step
                 self.kp = new_kp
                 self.ki = new_ki
                 self.kd = new_kd
 
-            # --- 5. RK4 积分 ---
+            # --- 5) RK4 integration ---
             k1_col = self.dt * Xd_col
             k2_col = self.dt * (self.A @ (X_col + k1_col / 2) + self.B * self.u + (F1 + F2) / 2)
             k3_col = self.dt * (self.A @ (X_col + k2_col / 2) + self.B * self.u + (F1 + F2) / 2)
@@ -155,11 +152,11 @@ class StateSpace:
             X_update_col = X_col + (k1_col + 2 * k2_col + 2 * k3_col + k4_col) / 6.0
             self.X[:, i + 1] = X_update_col.reshape(-1)
 
-            # --- 6. 输出计算 ---
+            # --- 6) Output ---
             Y_next = self.C @ X_update_col
-            self.Y[i+1] = Y_next.item()
+            self.Y[i + 1] = Y_next.item()
 
-        # 存储最后一个时间步的PID参数
+        # Store final PID gains
         self.kp_history[-1] = self.kp
         self.ki_history[-1] = self.ki
         self.kd_history[-1] = self.kd
@@ -168,47 +165,44 @@ class StateSpace:
 
     def plot_time_domain_response(self):
         """
-        绘制位移与传感器电压的时间响应曲线。
-        优化了布局逻辑，增强了学术作图的严谨性。
+        Plot tip displacement and sensor output over time.
         """
-        # 1. 计算时间轴 (确保 self.dt 已经定义)
+        # 1) Time axis (ensure dt is defined)
         N = self.X.shape[1]
         time_vector = np.arange(N) * self.dt
 
-        # 2. 计算合成位移
+        # 2) Composite displacement
         z = -2 * self.X[0, :] + 2 * self.X[1, :]
 
-        # 3. 创建画布：增加 dpi 提升清晰度，预设学术风格
-        plt.rcParams['font.sans-serif'] = ['SimHei']  # 解决中文显示问题
-        plt.rcParams['axes.unicode_minus'] = False
+        # 3) Plot layout
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
-        # 子图 1：动力学状态
+        # Subplot 1: dynamics state
         ax1.plot(time_vector, z, color='#1f77b4', linewidth=1.5, label=r'$z = -2X_0 + 2X_1$')
-        ax1.set_ylabel('位移 (m)', fontsize=12)
-        ax1.set_title('端部动力学响应 (真实值)', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Displacement (m)', fontsize=12)
+        ax1.set_title('Tip Dynamics Response', fontsize=14, fontweight='bold')
         ax1.legend(loc='upper right')
         ax1.grid(True, linestyle=':', alpha=0.7)
 
-        # 子图 2：传感器输出
+        # Subplot 2: sensor output
         ax2.plot(time_vector, self.Y.flatten(), color='#d62728', linewidth=1.5, label='Sensor Output')
-        ax2.set_ylabel('电压 (V)', fontsize=12)
-        ax2.set_title('传感器实测电压信号', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Voltage (V)', fontsize=12)
+        ax2.set_title('Measured Sensor Signal', fontsize=14, fontweight='bold')
         ax2.legend(loc='upper right')
         ax2.grid(True, linestyle=':', alpha=0.7)
 
-        # === 新增：子图 3：控制输入 u ===
+        # Subplot 3: control input
         ax3.plot(time_vector, self.u_history.flatten(), color='#2ca02c', linewidth=1.5, label='Control Input $u(t)$')
-        ax3.set_xlabel('时间 (s)', fontsize=12)
-        ax3.set_ylabel('u', fontsize=12)  # 如果u有物理量纲（电压/力），这里改成对应单位
-        ax3.set_title('控制输入时间历程', fontsize=14, fontweight='bold')
+        ax3.set_xlabel('Time (s)', fontsize=12)
+        ax3.set_ylabel('u', fontsize=12)
+        ax3.set_title('Control Input History', fontsize=14, fontweight='bold')
         ax3.legend(loc='upper right')
         ax3.grid(True, linestyle=':', alpha=0.7)
 
-        # 4. 细节微调
-        plt.tight_layout()  # 自动处理子图间距，防止标签重叠
+        # 4) Layout tweaks
+        plt.tight_layout()
 
-        # 保存时建议使用高质量格式
+        # Save high-quality figure
         plt.savefig('../../results/state_response.png', dpi=300, bbox_inches='tight')
         plt.show()
 
@@ -216,25 +210,25 @@ class StateSpace:
 if __name__ == '__main__':
     from config.config import Config
     from config.config_loader import load_mat
-    # 1. 基础配置加载
+    # 1) Base config
     config = Config()
     tn = config.EPISODE_LENGTH
 
-    # 2. 预加载热学数据
+    # 2) Load thermal data (optional)
     try:
         mt = load_mat()
     except Exception as e:
         print(f"Warning: mt_data load failed: {e}")
         mt = None
 
-    # 3. 【核心修正】模拟主进程预计算投影系数
+    # 3) Precompute projector coefficients
     from src.utils.utils import BeamDisturbanceProjector, create_noise_data
 
     proj = BeamDisturbanceProjector()
     projector_coeffs = proj.get_static_coeffs()
 
-    # 4. 生成噪声数据 (必须传入 projector_data)
-    # 你可以尝试修改 option 为 'impact' 来检查冲击是否出现在前半段
+    # 4) Generate disturbance data (projector_data required)
+    # Change option to 'impact' to check early impact behavior
     noise_data = create_noise_data(
         tn,
         option='impact',
@@ -243,8 +237,8 @@ if __name__ == '__main__':
         projector_data=projector_coeffs
     )
 
-    # 5. 实例化状态空间求解器
-    # 注意：dx 是空间步长，确保它与你的 beam 离散逻辑不冲突
+    # 5) Instantiate state-space solver
+    # Note: dx is spatial step; keep consistent with beam discretization
     state_space = StateSpace(
         config.SYSTEM_CONFIG,
         noise_data,
@@ -255,7 +249,7 @@ if __name__ == '__main__':
         kd=25
     )
 
-    # 6. 求解并绘图
+    # 6) Solve and plot
     print("Solving state space equations...")
     state_space.solve()
 

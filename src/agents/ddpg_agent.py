@@ -8,7 +8,7 @@ from .models import Actor, Critic
 
 
 class OUNoise:
-    """向量化的 Ornstein-Uhlenbeck 噪声 process"""
+    """Vectorized Ornstein-Uhlenbeck noise process."""
 
     def __init__(self, action_dim, num_envs=1, mu=0.0, theta=0.15, sigma=0.2, dt=0.01):
         self.action_dim = action_dim
@@ -24,7 +24,7 @@ class OUNoise:
         self.state = self.mu.copy()
 
     def sample(self):
-        """返回 (num_envs, action_dim) 形状的噪声"""
+        """Return noise with shape (num_envs, action_dim)."""
         x = self.state
         dx = self.theta * (self.mu - x) * self.dt + \
              self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mu.shape)
@@ -33,14 +33,14 @@ class OUNoise:
 
 
 class ReplayBuffer:
-    """经验回放缓冲区"""
+    """Standard replay buffer."""
 
     def __init__(self, buffer_size):
         self.buffer_size = buffer_size
         self.buffer = deque(maxlen=buffer_size)
 
     def add(self, state, action, reward, next_state, done):
-        # 兼容单条存储
+        # Single transition
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
@@ -56,8 +56,8 @@ class ReplayBuffer:
 class PermanentExpertMemory:
     def __init__(self, capacity=450000, expert_ratio=0.5):
         self.expert_ratio = expert_ratio
-        self.expert_buffer = []  # 列表：专家数据，只增不减
-        self.agent_buffer = deque(maxlen=capacity)  # 队列：RL数据
+        self.expert_buffer = []  # Expert data, append-only
+        self.agent_buffer = deque(maxlen=capacity)  # RL data
 
     def add(self, state, action, reward, next_state, done, is_expert=False):
         transition = (state, action, reward, next_state, done)
@@ -67,26 +67,26 @@ class PermanentExpertMemory:
             self.agent_buffer.append(transition)
 
     def sample(self, batch_size):
-        # 1. 计算配额
+        # 1) Determine mix ratio
         n_expert = int(batch_size * self.expert_ratio)
         n_agent = batch_size - n_expert
 
-        # 2. 边界检查：如果强制全专家 (ratio=1.0) 或 agent 池不够
+        # 2) Edge cases
         if n_agent == 0 or len(self.agent_buffer) < n_agent:
-            # 全从专家池采
+            # Sample only from experts
             batch = random.sample(self.expert_buffer, batch_size)
         elif len(self.expert_buffer) < n_expert:
-            # 理论上 Phase 0 后不会发生，防万一：全从 Agent 池采
+            # Should not happen after Phase 0; fallback to agent buffer
             batch = random.sample(self.agent_buffer, batch_size)
         else:
-            # 混合采样
+            # Mixed sampling
             expert_batch = random.sample(self.expert_buffer, n_expert)
             agent_batch = random.sample(self.agent_buffer, n_agent)
             batch = expert_batch + agent_batch
 
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        # 确保数据类型正确
+        # Ensure correct dtypes
         return (np.array(states), np.array(actions), np.array(rewards),
                 np.array(next_states), np.array(dones))
 
@@ -95,7 +95,7 @@ class PermanentExpertMemory:
 
 
 class DDPGAgent:
-    def __init__(self, config, num_envs=1):  # 增加 num_envs 参数
+    def __init__(self, config, num_envs=1):  # Added num_envs for vectorized noise
         self.config = config
         self.num_envs = num_envs
 
@@ -112,25 +112,25 @@ class DDPGAgent:
 
         self.memory = PermanentExpertMemory(capacity=config.BUFFER_SIZE * 3, expert_ratio=0.5)
 
-        # 向量化噪声
+        # Vectorized OU noise
         self.noise = OUNoise(config.ACTION_DIM,
-                             num_envs=num_envs,  # 传入环境数量
+                             num_envs=num_envs,
                              theta=0.3,
                              sigma=0.02,
                              dt=config.DT)
 
-        # 延迟更新计数器
+        # Delayed update counter
         self.update_cnt = 0
-        self.policy_freq = 2  # 甚至 Critic 更新 2 次，Actor 更新 1 次
+        self.policy_freq = 2  # Update critic twice for each actor update
 
     # ---------------------------------------------------------
-    # 针对 Phase 1: 纯 Actor 模仿学习 (Behavior Cloning)
+    # Phase 1: Actor behavior cloning
     # ---------------------------------------------------------
     def update_actor_supervised(self, batch_size=256):
         if len(self.memory.expert_buffer) < batch_size:
             return 0.0
 
-        # 强制从专家区采样
+        # Force sampling from expert pool
         states, actions, _, _, _ = self.memory.sample(batch_size)
 
         states = torch.FloatTensor(states).to(self.config.DEVICE)
@@ -141,19 +141,19 @@ class DDPGAgent:
 
         self.actor_optimizer.zero_grad()
         loss.backward()
-        # 即使是监督学习，也建议加梯度裁剪
+        # Gradient clipping is still useful even for supervised learning
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
         return loss.item()
 
     # ---------------------------------------------------------
-    # 针对 Phase 2: 纯 Critic 预热 (学习专家的价值函数)
+    # Phase 2: Critic warm-up (learn expert value function)
     # ---------------------------------------------------------
     def pretrain_critic(self, batch_size=256):
         if len(self.memory.expert_buffer) < batch_size:
             return 0.0
 
-        # 采样专家轨迹
+        # Sample expert trajectories
         states, actions, rewards, next_states, dones = self.memory.sample(batch_size)
 
         states = torch.FloatTensor(states).to(self.config.DEVICE)
@@ -163,7 +163,7 @@ class DDPGAgent:
         dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
 
         with torch.no_grad():
-            # 这里用目标 Actor(已通过BC更新) 来计算下一步动作
+            # Use target actor updated via BC to compute next action
             next_actions = self.actor_target(next_states)
             next_Q = self.critic_target(next_states, next_actions)
             target_Q = rewards + (1 - dones) * self.config.GAMMA * next_Q
@@ -176,7 +176,7 @@ class DDPGAgent:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
-        # 软更新 Critic Target
+        # Soft update critic target
         self.soft_update(self.critic_target, self.critic, self.config.TAU)
         return loss.item()
 
@@ -190,11 +190,11 @@ class DDPGAgent:
 
     def select_action(self, state, add_noise=True):
         """
-        支持 Batch 处理
+        Batch-friendly action selection.
         state: (state_dim,) or (num_envs, state_dim)
         Returns: (action_dim,) or (num_envs, action_dim)
         """
-        # 统一转为 tensor
+        # Convert to tensor
         state = np.array(state)
         if state.ndim == 1:
             state = state[None, :]  # (1, state_dim)
@@ -207,9 +207,9 @@ class DDPGAgent:
         self.actor.train()
 
         if add_noise:
-            # 噪声也是 (num_envs, action_dim)
+            # Noise is also (num_envs, action_dim)
             noise_sample = self.noise.sample()
-            # 如果当前是单条推理（比如测试时），只取噪声的第一行
+            # If single-state inference, only take the first noise row
             if action.shape[0] == 1 and noise_sample.shape[0] != 1:
                 action += noise_sample[0]
             else:
@@ -217,28 +217,28 @@ class DDPGAgent:
 
             action = np.clip(action, -1.0, 1.0)
 
-        # 如果输入是单个状态，返回单个动作；否则返回 Batch
+        # Return a flat action for single-state input
         if action.shape[0] == 1:
             return action.flatten()
         return action
 
     def store_transition(self, state, action, reward, next_state, done, is_expert=False):
-        # 增加 is_expert 参数向下传递
+        # Pass through is_expert flag
         self.memory.add(state, action, reward, next_state, done, is_expert=is_expert)
 
     def update_networks(self, update_actor=True, critic_iters=1):
         """
         Args:
-            update_actor: 是否更新 Actor (用于延迟更新)
-            critic_iters: Critic 更新次数
+            update_actor: whether to update the actor (used for delayed updates)
+            critic_iters: number of critic updates per call
         """
         if len(self.memory) < self.config.BATCH_SIZE:
             return None, None
 
         critic_loss_val = 0
 
-        # --- 循环更新 Critic 多次 ---
-        for i in range(critic_iters):
+        # --- Multiple critic updates ---
+        for _ in range(critic_iters):
             states, actions, rewards, next_states, dones = self.memory.sample(self.config.BATCH_SIZE)
 
             states = torch.FloatTensor(states).to(self.config.DEVICE)
@@ -247,10 +247,10 @@ class DDPGAgent:
             next_states = torch.FloatTensor(next_states).to(self.config.DEVICE)
             dones = torch.FloatTensor(dones).view(-1, 1).to(self.config.DEVICE)
 
-            # 更新 Critic
+            # Critic update
             with torch.no_grad():
                 next_actions = self.actor_target(next_states)
-                # 可以加入 Target Smoothing Noise
+                # Target smoothing noise
                 noise = torch.randn_like(next_actions) * 0.2
                 noise = noise.clamp(-0.5, 0.5)
                 next_actions = (next_actions + noise).clamp(-1.0, 1.0)
@@ -263,16 +263,15 @@ class DDPGAgent:
 
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # 梯度裁剪很重要
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Important for stability
             self.critic_optimizer.step()
 
             critic_loss_val += critic_loss.item()
 
-        # --- 延迟更新 Actor (只做一次) ---
+        # --- Delayed actor update (once) ---
         actor_loss_val = None
         if update_actor:
-            # 重新采样一次或者沿用最后一次的数据都可以，通常重新采样
-            # 为了省事，这里沿用最后一次的 states
+            # Reuse latest states for simplicity
             actor_actions = self.actor(states)
             actor_loss = -self.critic(states, actor_actions).mean()
 
@@ -281,7 +280,7 @@ class DDPGAgent:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
 
-            # 软更新
+            # Soft update targets
             self.soft_update(self.actor_target, self.actor, self.config.TAU)
             self.soft_update(self.critic_target, self.critic, self.config.TAU)
 

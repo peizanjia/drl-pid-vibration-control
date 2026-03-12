@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 import random
 
-# 项目内部导入
+# Project imports
 from src.environments.environment_2 import PIDControlEnvironment
 from src.agents.ddpg_agent import DDPGAgent
 from src.solvers.state_space_2 import StateSpace
@@ -14,7 +14,7 @@ from config.config import Config
 from config.config_loader import load_mat
 from src.utils.utils import BeamDisturbanceProjector, create_noise_data
 
-# 设置路径
+# Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT_DIR / "models"
 RESULTS_DIR = ROOT_DIR / "results"
@@ -48,10 +48,10 @@ def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs)
             cmd, data = remote.recv()
 
             if cmd == 'step':
-                action = data  # 归一化动作
+                action = data  # normalized action
                 next_state, reward, done, info = env.step(action)
 
-                # === 修改：用 env.current_step 取索引，而不是 env.state_space.current_step ===
+                # Use env.current_step (not env.state_space.current_step) for indexing
                 idx = max(env.current_step - 1, 0)
                 current_y = float(env.state_space.Y[idx]) if hasattr(env.state_space, "Y") else 0.0
                 info['abs_y'] = abs(current_y)
@@ -64,7 +64,7 @@ def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs)
                 remote.send(state)
 
             elif cmd == 'get_history':
-                # 兼容老版环境：kp/ki/kd 是数组字段
+                # Backward compatibility: kp/ki/kd are arrays
                 remote.send((
                     env.state_space.Y,
                     getattr(env.state_space, "Reference", np.zeros(env.episode_length)),
@@ -137,26 +137,26 @@ def train():
     start_time = time.time()
     history_rewards = []
 
-    # 1) 环境初始化
+    # 1) Initialize environments
     envs = ParallelEnv(config, num_envs=15)
 
-    # 2) Agent 初始化
+    # 2) Initialize agent
     agent = DDPGAgent(config, num_envs=1)
     agent.memory.expert_ratio = 1.0
 
     # ================================
-    # 回滚机制参数（新增）
+    # Rollback parameters (new)
     # ================================
     ROLLBACK_PATH = MODELS_DIR / "_checkpoint_last_good.pth"
-    # 爆炸后恢复更稳：降低探索噪声一段时间 / 暂停 actor 更新一段时间
+    # After an explosion: reduce exploration noise for a few episodes / pause actor updates
     EXPLODE_COOLDOWN_EP = 5
     cooldown_left = 0
 
-    # 你可以把阈值改成 1000（你说正常<300）
+    # You can raise this to 1000 if 300 is too strict
     DIVERGE_Y_THRESH = 1000.0
 
     # =========================================================================
-    # PHASE 0: 专家数据采集
+    # PHASE 0: Expert data collection
     # =========================================================================
     TARGET_EXPERT_SAMPLES = 750000
     print(f"\n>>> Phase 0: Robust Data Collection (Target: {TARGET_EXPERT_SAMPLES})...")
@@ -193,7 +193,7 @@ def train():
     print(f">>> Expert Pool Ready. Total Rounds: {round_idx}, Size: {len(agent.memory.expert_buffer)}")
 
     # =========================================================================
-    # PHASE 1: Actor BC
+    # PHASE 1: Actor behavior cloning
     # =========================================================================
     print("\n>>> Phase 1: Actor Behavior Cloning...")
     agent.memory.expert_ratio = 1.0
@@ -204,27 +204,27 @@ def train():
 
     agent.hard_update(agent.actor_target, agent.actor)
 
-    # 保存“最后良好”checkpoint（新增）
+    # Save "last good" checkpoint (new)
     agent.save_models(ROLLBACK_PATH)
 
     # =========================================================================
-    # PHASE 2: Critic 预热（固定迭代次数）
+    # PHASE 2: Critic warm-up (fixed iterations)
     # =========================================================================
     print("\n>>> Phase 2: Critic Value Warm-up...")
     for i in range(10000):
         c_loss = agent.pretrain_critic(batch_size=256)
-        if (i+1) % 1000 == 0:
+        if (i + 1) % 1000 == 0:
             print(f"  [Warmup] Iter {i+1} | Critic Loss: {c_loss:.6f}")
 
     agent.hard_update(agent.actor_target, agent.actor)
     agent.hard_update(agent.critic_target, agent.critic)
     print(">>> All Networks Pre-trained and Synced.")
 
-    # 更新回滚点（新增）
+    # Refresh rollback checkpoint (new)
     agent.save_models(ROLLBACK_PATH)
 
     # =========================================================================
-    # PHASE 3: RL 训练
+    # PHASE 3: RL fine-tuning
     # =========================================================================
     print("\n>>> Phase 3: Start RL Fine-tuning...")
     agent.memory.expert_ratio = 0.5
@@ -233,26 +233,25 @@ def train():
         states = envs.reset()
         agent.noise.reset()
 
-        # ===== 新增：爆炸冷却期策略 =====
-        # 冷却期内不更新 actor（只更新 critic），并降低探索噪声
+        # If in cooldown: do not update actor, only critic, and keep lower exploration noise
         update_actor_flag = True
         if cooldown_left > 0:
             update_actor_flag = False
             cooldown_left -= 1
-            # 如果你 OU 噪声支持动态 sigma，可在这里调小；否则只能接受固定 sigma
-            # 这里不强改 agent 代码，保持接口不变
+            # If OU noise supports dynamic sigma, reduce it here.
+            # We keep the interface stable and do not change agent internals.
 
         trajectory_buffers = [[] for _ in range(envs.num_envs)]
         current_ep_rewards = np.zeros(envs.num_envs, dtype=float)
         env_active_mask = np.ones(envs.num_envs, dtype=bool)
         failure_reasons = [""] * envs.num_envs
 
-        episode_exploded = False  # 新增：用于回滚判定
+        episode_exploded = False  # Used for rollback decisions
 
         for step in range(config.EPISODE_LENGTH):
             actions = np.zeros((envs.num_envs, config.ACTION_DIM), dtype=float)
 
-            # 1) 动作生成
+            # 1) Action generation
             for i in range(envs.num_envs):
                 if env_active_mask[i]:
                     action = agent.select_action(states[i], add_noise=True)
@@ -263,10 +262,10 @@ def train():
                     else:
                         actions[i] = action
 
-            # 2) 环境步进
+            # 2) Environment step
             next_states, rewards, dones, infos = envs.step(actions)
 
-            # 3) 审计
+            # 3) Audit
             for i in range(envs.num_envs):
                 if not env_active_mask[i]:
                     continue
@@ -281,29 +280,29 @@ def train():
                     env_active_mask[i] = False
                     failure_reasons[i] = "Diverged" if is_diverged else "NextState NaN"
                     episode_exploded = True
-                    # 终止经验先暂存，但注意：爆炸 episode 我们后面会整体丢弃，不写入 memory
+                    # Keep transition for this step but mark done. Episode will be discarded later.
                     trajectory_buffers[i].append((states[i], actions[i], -500.0, np.zeros_like(states[i]), True))
                     continue
 
                 trajectory_buffers[i].append((states[i], actions[i], r_val, next_states[i], bool(dones[i])))
                 current_ep_rewards[i] += r_val
 
-            # 4) 网络更新
+            # 4) Network update
             if len(agent.memory.agent_buffer) > config.BATCH_SIZE:
                 agent.update_networks(update_actor=(update_actor_flag and (step % 2 == 0)))
 
             states = next_states
 
-            # 如果已经爆炸，没必要继续推进（新增：提前结束本 episode）
+            # If exploded, stop early
             if episode_exploded:
                 break
 
-        # ===== Episode 结束处理 =====
+        # ===== Episode end handling =====
         valid_count = int(np.sum(env_active_mask))
 
-        # 新增：更严格的“爆炸判定”
-        # - 任一 env 出现 NaN/发散（episode_exploded）
-        # - 或 avg_reward 不是有限值
+        # Strict explosion check:
+        # - any env exploded, or
+        # - avg_reward is not finite
         if valid_count > 0:
             avg_reward = np.mean([current_ep_rewards[i] for i in range(envs.num_envs) if env_active_mask[i]])
         else:
@@ -311,7 +310,7 @@ def train():
 
         if (episode_exploded or (not np.isfinite(avg_reward))):
             # ------------------------------
-            # 回滚策略（新增，核心）
+            # Rollback strategy (new, core)
             # ------------------------------
             print(f"[Rollback] Ep {episode} exploded. Reverting to last good checkpoint and discarding episode data.")
             try:
@@ -319,19 +318,18 @@ def train():
             except Exception as e:
                 print(f"[Rollback] Failed to load checkpoint: {e}")
 
-            # 丢弃本回合所有 trajectory_buffers（不写入 agent_buffer） -> 避免污染
+            # Discard this episode's trajectories to avoid contamination
             history_rewards.append(np.nan)
 
-            # 进入冷却期：先只训 critic 不训 actor，降低继续爆炸概率
+            # Enter cooldown: update critic only, reduce chances of repeated explosions
             cooldown_left = EXPLODE_COOLDOWN_EP
 
-            # 保存失败信息
             failed_modes = [f"{envs.mode_list[i]}({failure_reasons[i]})"
                             for i in range(envs.num_envs) if not env_active_mask[i]]
             print(f"Ep {episode:3d} | Valid: {valid_count:2d}/15 | AvgR:   NaN | Fail: {failed_modes[:3]}...")
             continue
 
-        # 正常回合：刷入 agent_buffer
+        # Normal episode: append to agent_buffer
         for i in range(envs.num_envs):
             if trajectory_buffers[i]:
                 for t in trajectory_buffers[i]:
@@ -344,10 +342,10 @@ def train():
 
         print(f"Ep {episode:3d} | Valid: {valid_count:2d}/15 | AvgR: {avg_reward:9.2f} | Fail: {failed_modes[:2]}...")
 
-        # 正常回合：更新“最后良好回滚点”（新增）
+        # Update "last good" checkpoint (new)
         agent.save_models(ROLLBACK_PATH)
 
-        # --- 你原来的绘图功能保留 ---
+        # Keep original plotting behavior
         agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
 
         target_modes = ['impact', 'mixed']
@@ -377,11 +375,11 @@ def train():
             except Exception as e:
                 print(f"Plotting failed: {e}")
 
-    # 训练结束
+    # Training finished
     print(f"Training Finished. Total Time: {(time.time() - start_time) / 60:.1f} min")
     agent.save_models(MODELS_DIR / 'ddpg_final_robust.pth')
 
-    # 训练曲线（原样保留）
+    # Training curve (keep original behavior)
     plt.figure(figsize=(12, 6))
     rewards_np = np.array(history_rewards, dtype=float)
     plt.plot(rewards_np, linewidth=1.5, label='Average Reward')
@@ -403,7 +401,7 @@ def train():
 
 
 if __name__ == '__main__':
-    # Windows 多进程建议
+    # Windows multiprocessing guidance
     try:
         mp.set_start_method('spawn')
     except RuntimeError:
