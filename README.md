@@ -1,6 +1,6 @@
 # DRL-PID Vibration Control of a Spaceborne Flexible Beam
 
-This project is the offical implementation of the paper (not published yet)
+This project is the official implementation of the paper (not published yet)
 "Deep Reinforcement Learning-Based Gain-Scheduled PID Vibration Control of a Spaceborne Flexible Beam".
 
 ## Overview
