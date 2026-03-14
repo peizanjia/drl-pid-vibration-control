@@ -87,7 +87,7 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
     if not isinstance(tn, (int, np.integer)) or tn <= 0:
         raise ValueError("tn must be positive integer")
 
-    valid_options = ['normal', 'jitter', 'maneuver', 'impact', 'mixed', 'thermal']
+    valid_options = ['normal', 'jitter', 'maneuver', 'impact', 'mixed', 'thermal', 'free']
     if option not in valid_options:
         raise ValueError(f"Unknown option: {option}")
 
@@ -109,7 +109,7 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
     # ----------------------------------------------------
     # 2) Jitter: always present for non-normal modes
     # ----------------------------------------------------
-    if option != 'normal':
+    if option not in ['normal', 'free']:
         f_base = np.random.uniform(80, 200)
         amp = np.random.uniform(0.002, 0.008)
         jitter_signal = np.zeros(tn)
@@ -203,5 +203,42 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
             for i in range(4):
                 coeff = system_config.get(f'D{i + 1}', 0.0)
                 modal_forces[:, i] += coeff * mt_slice
+
+    # -> Free vibration (small deterministic impulse)
+    if option == 'free':
+
+        t_imp_start = 0.01     # fixed early excitation
+        x_loc = 5.0            # beam tip
+        f_peak = 3.0           # small force
+        dt_imp = 0.08          # short duration
+
+        start_idx = int(t_imp_start / dt)
+        steps_imp = int(dt_imp / dt)
+        end_idx = min(start_idx + steps_imp, tn)
+
+        if start_idx < tn:
+
+            t_local = np.arange(end_idx - start_idx) * dt
+            pulse = f_peak * np.sin(np.pi * t_local / dt_imp)
+
+            # same projection as impact
+            L = 5.0
+            betas = np.array([1.875, 4.694, 7.855, 10.996])
+
+            imp_coeffs = []
+
+            for k in range(4):
+                beta = betas[k] / L
+                bx = beta * x_loc
+                bL = betas[k]
+
+                sigma = (np.cosh(bL) + np.cos(bL)) / (np.sinh(bL) + np.sin(bL))
+
+                phi_val = (np.cosh(bx) - np.cos(bx)) - sigma * (np.sinh(bx) - np.sin(bx))
+
+                imp_coeffs.append(phi_val / Mi_vals[k])
+
+            for i in range(4):
+                modal_forces[start_idx:end_idx, i] += imp_coeffs[i] * pulse
 
     return {f'F{i + 1}': np.column_stack([time_axis, modal_forces[:, i]]) for i in range(4)}

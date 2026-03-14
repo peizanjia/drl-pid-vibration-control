@@ -251,7 +251,6 @@ def save_three_figs(
     ax1.axhline(0.0, color="0.3", linestyle="--", linewidth=0.6)
 
     ax1.set_ylabel("Vibration signal (V)")
-    ax1.set_title(f"{scenario_key} | Controller comparison", fontweight="bold")
     ax1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
     # tip displacement
@@ -313,7 +312,6 @@ def save_three_figs(
 
     cx.set_xlabel("Time (s)")
     cx.set_ylabel("Control input (V)")
-    cx.set_title(f"{scenario_key} | Control input", fontweight="bold")
     cx.legend(frameon=False, loc="upper left", fontsize=legend_fs)
 
     fig2.tight_layout()
@@ -350,7 +348,6 @@ def save_three_figs(
 
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("PID gains")
-        ax.set_title(f"{scenario_key} | DRL-PID gains", fontweight="bold")
         ax.legend(frameon=False, fontsize=8)
 
         fig3.tight_layout()
@@ -401,10 +398,11 @@ def main():
     # keep your modified plot ranges / zoom ranges
     scenarios = {
         "Jitter":   {"noise_option": "jitter",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
-        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0), "zoom_range": (65.0, 70.0)},
+        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
         "Impact":   {"noise_option": "impact",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (5.0, 15.0),  "zoom_range": None},
         "Maneuver": {"noise_option": "maneuver", "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (18.0, 23.0), "zoom_range": None},
-        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0), "zoom_range": (65.0, 70.0)},
+        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
+        "Free":     {"noise_option": "free",     "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 2.5),  "zoom_range": None},
     }
 
     # LQG hyperparameters

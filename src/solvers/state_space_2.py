@@ -231,7 +231,7 @@ if __name__ == '__main__':
     # Change option to 'impact' to check early impact behavior
     noise_data = create_noise_data(
         tn,
-        option='impact',
+        option='free',
         system_config=config.SYSTEM_CONFIG,
         mt_data=mt,
         projector_data=projector_coeffs
