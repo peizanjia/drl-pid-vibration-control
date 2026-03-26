@@ -397,17 +397,17 @@ def main():
 
     # keep your modified plot ranges / zoom ranges
     scenarios = {
-        "Jitter":   {"noise_option": "jitter",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
-        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
-        "Impact":   {"noise_option": "impact",   "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (5.0, 15.0),  "zoom_range": None},
-        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (18.0, 23.0), "zoom_range": None},
-        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
-        "Free":     {"noise_option": "free",     "fixed_pid": [150.0, 30.0, 20.0], "plot_range": (0.0, 2.5),  "zoom_range": None},
+        "Jitter":   {"noise_option": "jitter",   "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
+        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
+        "Impact":   {"noise_option": "impact",   "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (5.0, 15.0),  "zoom_range": None},
+        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (18.0, 23.0), "zoom_range": None},
+        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
+        "Free":     {"noise_option": "free",     "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 2.5),  "zoom_range": None},
     }
 
     # LQG hyperparameters
-    Q_lqr = np.diag([1, 1, 10, 10])
-    R_lqr = np.array([[1e-7]])
+    Q_lqr = np.diag([10, 10, 1, 1])
+    R_lqr = np.array([[1e-8]])
     W_kf = np.diag([1e-6, 1e-6, 1e-3, 1e-3])
     V_kf = np.array([[1e-4]])
 

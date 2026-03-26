@@ -231,7 +231,7 @@ if __name__ == '__main__':
     # Change option to 'impact' to check early impact behavior
     noise_data = create_noise_data(
         tn,
-        option='free',
+        option='maneuver',
         system_config=config.SYSTEM_CONFIG,
         mt_data=mt,
         projector_data=projector_coeffs
@@ -245,8 +245,8 @@ if __name__ == '__main__':
         dt=config.DT,
         tn=tn,
         kp=100,
-        ki=50,
-        kd=25
+        ki=30,
+        kd=27
     )
 
     # 6) Solve and plot

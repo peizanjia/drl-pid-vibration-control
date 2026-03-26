@@ -278,9 +278,9 @@ class PSO_PID:
         noise_data_list,   # length=5
         dt,
         tn,
-        kp_bounds=(0.0, 500.0),
-        ki_bounds=(0.0, 500.0),
-        kd_bounds=(0.0, 200.0),
+        kp_bounds=(0.0, 170.0),
+        ki_bounds=(0.0, 50.0),
+        kd_bounds=(0.0, 25.0),
         n_particles=30,
         n_iters=60,
         w=0.72,

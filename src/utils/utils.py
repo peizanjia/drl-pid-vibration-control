@@ -126,36 +126,32 @@ def create_noise_data(tn, dt=0.01, option='normal', system_config=None, mt_data=
     # 3) Mode-specific components
     # ----------------------------------------------------
 
-    # -> Maneuver (rest-to-rest)
+    # -> Maneuver (bang-bang rest-to-rest)
     if option in ['maneuver', 'mixed']:
         t_start = np.random.uniform(0.1, 0.2) * tn * dt
-        duration = np.random.uniform(1.5, 3.5)
-        max_alpha = np.random.uniform(0.05, 0.15)
+        duration = np.random.uniform(5.0, 10.0)
 
-        # Random direction of the slew (keeps rest-to-rest property)
+        theta_f = np.random.uniform(0.5, 1.0)  # 角度（rad）
+        max_alpha = 4 * theta_f / duration ** 2
+
         direction = np.random.choice([-1.0, 1.0])
 
-        mask = (time_axis >= t_start) & (time_axis < t_start + duration)
-        if np.any(mask):
-            t_local = time_axis[mask] - t_start
+        alpha_t = np.zeros(tn)
 
-            alpha_t = np.zeros(tn)
+        half = 0.5 * duration
 
-            # Split into two halves: accelerate then decelerate (net rate change = 0)
-            half = 0.5 * duration
-            mask1 = mask & (time_axis < t_start + half)
-            mask2 = mask & (time_axis >= t_start + half)
+        # +alpha_max
+        mask1 = (time_axis >= t_start) & (time_axis < t_start + half)
+        if np.any(mask1):
+            alpha_t[mask1] = direction * max_alpha
 
-            if np.any(mask1):
-                t1 = time_axis[mask1] - t_start
-                alpha_t[mask1] = direction * max_alpha * 0.5 * (1 - np.cos(2 * np.pi * t1 / duration))
+        # -alpha_max
+        mask2 = (time_axis >= t_start + half) & (time_axis < t_start + duration)
+        if np.any(mask2):
+            alpha_t[mask2] = -direction * max_alpha
 
-            if np.any(mask2):
-                t2 = time_axis[mask2] - (t_start + half)
-                alpha_t[mask2] = -direction * max_alpha * 0.5 * (1 - np.cos(2 * np.pi * t2 / duration))
-
-            for i in range(4):
-                modal_forces[:, i] += maneuver_coeffs[i] * alpha_t
+        for i in range(4):
+            modal_forces[:, i] += maneuver_coeffs[i] * alpha_t
 
     # -> Impact (force it to occur in the early part)
     if option == 'impact':
