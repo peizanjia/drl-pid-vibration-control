@@ -82,7 +82,7 @@ def worker(remote, parent_remote, config, noise_type, mt_data, projector_coeffs)
 
 
 class ParallelEnv:
-    def __init__(self, config, num_envs=15):
+    def __init__(self, config, num_envs=18):
         self.config = config
         print("Loading thermal data...")
         try:
@@ -94,7 +94,7 @@ class ParallelEnv:
         proj = BeamDisturbanceProjector()
         projector_coeffs = proj.get_static_coeffs()
 
-        base_modes = ['jitter', 'maneuver', 'impact', 'mixed', 'thermal']
+        base_modes = ['jitter', 'maneuver', 'impact', 'mixed', 'thermal', 'free']
         self.mode_list = (base_modes * 3)[:num_envs]
         self.num_envs = len(self.mode_list)
 
@@ -138,7 +138,7 @@ def train():
     history_rewards = []
 
     # 1) Initialize environments
-    envs = ParallelEnv(config, num_envs=15)
+    envs = ParallelEnv(config, num_envs=18)
 
     # 2) Initialize agent
     agent = DDPGAgent(config, num_envs=1)
@@ -161,7 +161,7 @@ def train():
     TARGET_EXPERT_SAMPLES = 750000
     print(f"\n>>> Phase 0: Robust Data Collection (Target: {TARGET_EXPERT_SAMPLES})...")
 
-    expert_pid = np.array([100.0, 5.0, 25.0], dtype=float)
+    expert_pid = np.array([10.0, 25.0, 25.0], dtype=float)
     expert_action_norm = config.normalize_action(expert_pid)
 
     current_samples = 0
@@ -300,11 +300,27 @@ def train():
         # ===== Episode end handling =====
         valid_count = int(np.sum(env_active_mask))
 
-        # Strict explosion check:
-        # - any env exploded, or
-        # - avg_reward is not finite
+        # 1. Define weight of each scenario
+        mode_weights = {
+            'jitter': 2e2,
+            'maneuver': 1.0,
+            'impact': 2e-5,
+            'mixed': 0.1,
+            'thermal': 0.1,
+            'free': 1
+        }
+
+        # 2. Compute weighted average
         if valid_count > 0:
-            avg_reward = np.mean([current_ep_rewards[i] for i in range(envs.num_envs) if env_active_mask[i]])
+            total_weighted_reward = 0.0
+            total_weight = 0.0
+            for i in range(envs.num_envs):
+                if env_active_mask[i]:
+                    m_name = envs.mode_list[i]
+                    w = mode_weights.get(m_name, 1.0)
+                    total_weighted_reward += current_ep_rewards[i] * w
+                    total_weight += w
+            avg_reward = total_weighted_reward / total_weight if total_weight > 0 else np.nan
         else:
             avg_reward = np.nan
 
@@ -326,7 +342,7 @@ def train():
 
             failed_modes = [f"{envs.mode_list[i]}({failure_reasons[i]})"
                             for i in range(envs.num_envs) if not env_active_mask[i]]
-            print(f"Ep {episode:3d} | Valid: {valid_count:2d}/15 | AvgR:   NaN | Fail: {failed_modes[:3]}...")
+            print(f"Ep {episode:3d} | Valid: {valid_count:2d}/{envs.num_envs} | AvgR: {avg_reward:9.2f} | Fail: {failed_modes[:2]}...")
             continue
 
         # Normal episode: append to agent_buffer
@@ -340,12 +356,15 @@ def train():
 
         history_rewards.append(avg_reward)
 
-        print(f"Ep {episode:3d} | Valid: {valid_count:2d}/15 | AvgR: {avg_reward:9.2f} | Fail: {failed_modes[:2]}...")
+        # OU Noise attenuation
+        if hasattr(agent, 'noise') and hasattr(agent.noise, 'sigma'):
+            agent.noise.sigma = max(0.02, agent.noise.sigma * 0.99)
+
+        print(f"Ep {episode:3d} | Valid: {valid_count:2d}/{envs.num_envs} | AvgR: {avg_reward:9.2f} | Fail: {failed_modes[:2]}...")
 
         # Update "last good" checkpoint (new)
         agent.save_models(ROLLBACK_PATH)
 
-        # Keep original plotting behavior
         agent.save_models(MODELS_DIR / f'ddpg_ep_{episode}.pth')
 
         target_modes = ['impact', 'mixed']

@@ -44,10 +44,13 @@ from src.solvers.state_space_baseline import (
 # ============================================================
 
 class DRLPIDController(ControllerBase):
-    def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int):
+    def __init__(self, agent: DDPGAgent, conf: Config, episode_length: int, alpha_p: float=0.4, alpha_i: float=0.3, alpha_d: float=1):
         self.agent = agent
         self.conf = conf
         self.T = episode_length
+        self.alpha_p = alpha_p
+        self.alpha_i = alpha_i
+        self.alpha_d = alpha_d
 
         self.u_prev = 0.0
         self.e = 0.0
@@ -58,6 +61,10 @@ class DRLPIDController(ControllerBase):
         self.kp_hist = None
         self.ki_hist = None
         self.kd_hist = None
+
+        self.kp_prev = None
+        self.ki_prev = None
+        self.kd_prev = None
 
         self._last_pid = (0.0, 0.0, 0.0)
 
@@ -70,6 +77,7 @@ class DRLPIDController(ControllerBase):
         self._last_pid = (0.0, 0.0, 0.0)
 
         self.kp_hist = self.ki_hist = self.kd_hist = None
+        self.kp_prev = self.kp_prev = self.kd_prev = None
 
     def setup_history(self, tn: int) -> None:
         self.kp_hist = np.zeros(tn, dtype=float)
@@ -105,18 +113,28 @@ class DRLPIDControllerWithC(DRLPIDController):
         self.ei = float(self.ei + self.e * dt)
         self.ed = float((self.C @ np.asarray(xdot).reshape(-1, 1)).item())
 
+        # 1. DRL Agent raw action
         obs = self._obs(t_norm)
         action = self.agent.select_action(obs, add_noise=False)
-        pid_phys = self.conf.denormalize_action(action)
+        pid_raw = self.conf.denormalize_action(action)
 
-        kp, ki, kd = float(pid_phys[0]), float(pid_phys[1]), float(pid_phys[2])
+        kp_raw, ki_raw, kd_raw = float(pid_raw[0]), float(pid_raw[1]), float(pid_raw[2])
+
+        # 2. Low-Pass filter
+        if self.kp_prev is None:
+            # Parameter initialization
+            self.kp_prev, self.ki_prev, self.kd_prev = kp_raw, ki_raw, kd_raw
+        else:
+            self.kp_prev = self.alpha_p * kp_raw + (1 - self.alpha_p) * self.kp_prev
+            self.ki_prev = self.alpha_i * ki_raw + (1 - self.alpha_i) * self.ki_prev
+            self.kd_prev = self.alpha_d * kd_raw + (1 - self.alpha_d) * self.kd_prev
+
+        kp, ki, kd = self.kp_prev, self.ki_prev, self.kd_prev
         self._last_pid = (kp, ki, kd)
 
         u = kp * self.e - ki * self.ei - kd * self.ed
 
-        # if simulator.run() calls set_applied_u, this will be overwritten to saturated u
         self.u_prev = float(u)
-
         self.step_idx += 1
         return float(u)
 
@@ -181,12 +199,12 @@ def add_inset_multi(
 
     mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.35", lw=0.8)
 
-def mse_itse_from_window(t: np.ndarray, sig: np.ndarray, plot_range: Tuple[float, float], dt: float) -> Tuple[float, float]:
+def iae_itae_from_window(t: np.ndarray, sig: np.ndarray, plot_range: Tuple[float, float], dt: float) -> Tuple[float, float]:
     """
-    Compute MSE and ITSE for signal 'sig' over [plot_range[0], plot_range[1]].
+    Compute IAE and ITAE for signal 'sig' over [plot_range[0], plot_range[1]].
     Error definition: e(t) = sig(t) (ref = 0).
     Time is re-timed: tp = t - plot_range[0].
-    ITSE = integral(tp * e(tp)^2) dt ~= sum(tp * e^2) * dt
+    ITAE = integral(tp * e(tp)^2) dt ~= sum(tp * e^2) * dt
     """
     mask = (t >= plot_range[0]) & (t <= plot_range[1])
     if not np.any(mask):
@@ -196,9 +214,42 @@ def mse_itse_from_window(t: np.ndarray, sig: np.ndarray, plot_range: Tuple[float
     tp = t[mask] - t0
     e = np.asarray(sig, dtype=float)[mask]
 
-    mse = float(np.mean(e ** 2))
-    itse = float(np.sum(tp * (e ** 2)) * dt)
-    return mse, itse
+    iae = float(np.sum(abs(e)) * dt)
+    itae = float(np.sum(tp * (abs(e))) * dt)
+    return iae, itae
+
+def save_data_to_txt(out_dir: Path, scenario_key: str, tp: np.ndarray,
+                     res_un: Dict, res_drl: Dict, res_pid: Dict, res_lqg: Dict, mask: np.ndarray):
+    txt_path = out_dir / f"{scenario_key}_plot_data.txt"
+
+    # Y: Vibration, Z: Tip Displacement, U: Control Input
+    Yu, Zu, Uu = res_un["Y"][mask], tip_disp(res_un["X"][:, mask]), res_un["U"][mask]
+    Yd, Zd, Ud = res_drl["Y"][mask], tip_disp(res_drl["X"][:, mask]), res_drl["U"][mask]
+    Yp, Zp, Up = res_pid["Y"][mask], tip_disp(res_pid["X"][:, mask]), res_pid["U"][mask]
+    Yg, Zg, Ug = res_lqg["Y"][mask], tip_disp(res_lqg["X"][:, mask]), res_lqg["U"][mask]
+
+    # Assemble matrix [Time, Yu, Zu, Uu, Yd, Zd, Ud, Yp, Zp, Up, Yg, Zg, Ug]
+    data_matrix = np.column_stack([
+        tp,
+        Yu, Zu, Uu,
+        Yd, Zd, Ud,
+        Yp, Zp, Up,
+        Yg, Zg, Ug
+    ])
+
+    header = "Time Yu Zu Uu Yd Zd Ud Yp Zp Up Yg Zg Ug"
+    np.savetxt(txt_path, data_matrix, fmt="%.8e", header=header, comments='% ')
+    print(f"[DATA] Saved main plot data to: {txt_path}")
+
+    ctrl = res_drl.get("controller", {})
+    if ctrl.get("kp") is not None:
+        gain_path = out_dir / f"{scenario_key}_drl_gains.txt"
+        kp, ki, kd = ctrl["kp"][mask], ctrl["ki"][mask], ctrl["kd"][mask]
+        gain_matrix = np.column_stack([tp, kp, ki, kd])
+        # Exclude the last point if it's zeroed out due to episode end
+        gain_matrix = gain_matrix[:-1, :]
+        np.savetxt(gain_path, gain_matrix, fmt="%.8e", header="Time Kp Ki Kd", comments='% ')
+        print(f"[DATA] Saved DRL gains to: {gain_path}")
 
 def save_three_figs(
     out_dir: Path,
@@ -235,6 +286,7 @@ def save_three_figs(
     lw_un = 0.45
 
     legend_fs = 8
+    fontsize = 10
 
     # =========================================================
     # Fig1: Vibration + Tip displacement (4 controllers)
@@ -244,7 +296,7 @@ def save_three_figs(
 
     # vibration signal
     ax1.plot(tp, Yu[mask], color=c_un, linestyle=":", linewidth=lw_un, label="Uncontrolled", zorder=1)
-    ax1.plot(tp, Yp[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    ax1.plot(tp, Yp[mask], color=c_pid, linestyle="--", linewidth=lw, label="PSO-PID", zorder=2)
     ax1.plot(tp, Yg[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
     ax1.plot(tp, Yd[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
 
@@ -252,16 +304,18 @@ def save_three_figs(
 
     ax1.set_ylabel("Vibration signal (V)")
     ax1.legend(frameon=False, loc="upper left", fontsize=legend_fs)
+    ax1.text(0.95, 0.95, "(a)", transform=ax1.transAxes, fontsize=fontsize, fontweight="bold", va="top")
 
     # tip displacement
     ax2.plot(tp, Zu[mask], color=c_un, linestyle=":", linewidth=lw_un, label="Uncontrolled", zorder=1)
-    ax2.plot(tp, Zp[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    ax2.plot(tp, Zp[mask], color=c_pid, linestyle="--", linewidth=lw, label="PSO-PID", zorder=2)
     ax2.plot(tp, Zg[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
     ax2.plot(tp, Zd[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
 
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Tip displacement (m)")
     ax2.legend(frameon=False, loc="upper left", fontsize=legend_fs)
+    ax2.text(0.95, 0.95, "(b)", transform=ax2.transAxes, fontsize=fontsize, fontweight="bold", va="top")
 
     # ---------------- inset for thermal / mixed ----------------
     if scenario_key.lower() in ["thermal", "mixed"]:
@@ -270,12 +324,12 @@ def save_three_figs(
         zoom_start = tp[-1] - zoom_len
         zoom_end = tp[-1]
 
-        inset = ax1.inset_axes([0.62, 0.55, 0.33, 0.33])
+        inset = ax1.inset_axes([0.62, 0.50, 0.33, 0.33])
 
         zoom_mask = (tp >= zoom_start) & (tp <= zoom_end)
 
         inset.plot(tp[zoom_mask], Yp[mask][zoom_mask],
-                   color=c_pid, linestyle="--", linewidth=0.6, label="Large Gain PID")
+                   color=c_pid, linestyle="--", linewidth=0.6, label="PSO-PID")
 
         inset.plot(tp[zoom_mask], Yd[mask][zoom_mask],
                    color=c_drl, linestyle="-", linewidth=0.6, label="DRL-PID")
@@ -306,7 +360,7 @@ def save_three_figs(
 
     fig2, cx = plt.subplots(1, 1, figsize=(6.6, 3.3))
 
-    cx.plot(tp, Up[mask], color=c_pid, linestyle="--", linewidth=lw, label="Large Gain PID", zorder=2)
+    cx.plot(tp, Up[mask], color=c_pid, linestyle="--", linewidth=lw, label="PSO-PID", zorder=2)
     cx.plot(tp, Ug[mask], color=c_lqg, linestyle="-.", linewidth=lw, label="LQG", zorder=3)
     cx.plot(tp, Ud[mask], color=c_drl, linestyle="-", linewidth=lw, label="DRL-PID", zorder=5)
 
@@ -319,7 +373,7 @@ def save_three_figs(
     plt.close(fig2)
 
     # =========================================================
-    # Fig3: DRL-PID gains
+    # Fig3: DRL-PID gains (Excluded last zeroed point)
     # =========================================================
 
     ctrl = res_drl.get("controller", {})
@@ -328,27 +382,25 @@ def save_three_figs(
     kd_all = ctrl.get("kd", None)
 
     if kp_all is not None and ki_all is not None and kd_all is not None:
-
         kp_seg = kp_all[mask]
         ki_seg = ki_all[mask]
         kd_seg = kd_all[mask]
-
         tp_full = tp
 
-        if scenario_key.lower() in ["thermal", "mixed"]:
-            pid_mask = (tp_full <= 10.0)
-        else:
-            pid_mask = np.ones_like(tp_full, dtype=bool)
+        plot_mask = np.ones_like(tp_full, dtype=bool)
+        plot_mask[-1] = False
 
         fig3, ax = plt.subplots(1, 1, figsize=(6.6, 3.3))
 
-        ax.plot(tp_full[pid_mask], kp_seg[pid_mask], linewidth=0.7, label=r"$K_p$")
-        ax.plot(tp_full[pid_mask], ki_seg[pid_mask], linewidth=0.7, label=r"$K_i$")
-        ax.plot(tp_full[pid_mask], kd_seg[pid_mask], linewidth=0.7, label=r"$K_d$")
+        ax.plot(tp_full[plot_mask], kp_seg[plot_mask], linestyle="--", linewidth=1.0, label=r"$K_p$")
+        ax.plot(tp_full[plot_mask], ki_seg[plot_mask], linestyle="-.", linewidth=1.0, label=r"$K_i$")
+        ax.plot(tp_full[plot_mask], kd_seg[plot_mask], linestyle="-", linewidth=1.0, label=r"$K_d$")
 
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("PID gains")
-        ax.legend(frameon=False, fontsize=8)
+        ax.set_xlabel("Time (s)", fontsize=9)
+        ax.set_ylabel("PID gains", fontsize=9)
+        ax.legend(loc="upper left", frameon=False, fontsize=8)
+
+        ax.grid(True, linestyle=":", alpha=0.6)
 
         fig3.tight_layout()
         fig3.savefig(out_dir / f"{scenario_key}_fig3_drl_pid_gains.pdf", bbox_inches="tight")
@@ -374,7 +426,7 @@ def main():
     # Agent
     agent = DDPGAgent(conf)
 
-    model_rel = r"models\ddpg_ep_63.pth"
+    model_rel = r"models\ddpg_ep_62.pth"
     model_path = os.path.join(project_root, model_rel)
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
@@ -397,16 +449,16 @@ def main():
 
     # keep your modified plot ranges / zoom ranges
     scenarios = {
-        "Jitter":   {"noise_option": "jitter",   "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 10.0),  "zoom_range": None},
-        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
-        "Impact":   {"noise_option": "impact",   "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (5.0, 15.0),  "zoom_range": None},
-        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (18.0, 23.0), "zoom_range": None},
-        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 70.0),  "zoom_range": (65.0, 70.0)},
-        "Free":     {"noise_option": "free",     "fixed_pid": [0.0, 0.0, 27.0], "plot_range": (0.0, 2.5),  "zoom_range": None},
+        "Jitter":   {"noise_option": "jitter",   "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (4.35, 10.35),  "zoom_range": None},
+        "Thermal":  {"noise_option": "thermal",  "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (0.0, 100.0),  "zoom_range": (95.0, 100.0)},
+        "Impact":   {"noise_option": "impact",   "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (5.0, 15.0),  "zoom_range": None},
+        "Maneuver": {"noise_option": "maneuver", "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (18.2, 26.2), "zoom_range": None},
+        "Mixed":    {"noise_option": "mixed",    "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (0.0, 100.0),  "zoom_range": (95.0, 100.0)},
+        "Free":     {"noise_option": "free",     "fixed_pid": [58.0, 11.2, 27.6], "plot_range": (0.0, 1.5),  "zoom_range": None},
     }
 
     # LQG hyperparameters
-    Q_lqr = np.diag([10, 10, 1, 1])
+    Q_lqr = np.diag([12.51**2, 77.25**2, 1, 1])
     R_lqr = np.array([[1e-8]])
     W_kf = np.diag([1e-6, 1e-6, 1e-3, 1e-3])
     V_kf = np.array([[1e-4]])
@@ -465,21 +517,26 @@ def main():
         res_pid = sim.run(ctrl_pid)
         res_lqg = sim.run(ctrl_lqg)
 
-        # ---------------- Metrics: MSE / ITSE (based on Vibration signal Y, ref=0) ----------------
+        # ---------------- Metrics: IAE / ITAE (based on Vibration signal Y, ref=0) ----------------
         t = res_un["t"]
 
-        mse_un,  itse_un  = mse_itse_from_window(t, res_un["Y"],  plot_range, dt)
-        mse_drl, itse_drl = mse_itse_from_window(t, res_drl["Y"], plot_range, dt)
-        mse_pid, itse_pid = mse_itse_from_window(t, res_pid["Y"], plot_range, dt)
-        mse_lqg, itse_lqg = mse_itse_from_window(t, res_lqg["Y"], plot_range, dt)
+        iae_un,  itae_un  = iae_itae_from_window(t, res_un["Y"], plot_range, dt)
+        iae_drl, itae_drl = iae_itae_from_window(t, res_drl["Y"], plot_range, dt)
+        iae_pid, itae_pid = iae_itae_from_window(t, res_pid["Y"], plot_range, dt)
+        iae_lqg, itae_lqg = iae_itae_from_window(t, res_lqg["Y"], plot_range, dt)
 
         print(f"\n[{scen_name}] Metrics on Vibration signal Y (window {plot_range[0]}-{plot_range[1]} s, retimed tp):")
-        print(f"  Uncontrolled   : MSE={mse_un:.6e} | ITSE={itse_un:.6e}")
-        print(f"  DRL-PID        : MSE={mse_drl:.6e} | ITSE={itse_drl:.6e}")
-        print(f"  Large Gain PID : MSE={mse_pid:.6e} | ITSE={itse_pid:.6e}")
-        print(f"  LQG            : MSE={mse_lqg:.6e} | ITSE={itse_lqg:.6e}")
+        print(f"  Uncontrolled   : IAE={iae_un:.6e} | ITAE={itae_un:.6e}")
+        print(f"  DRL-PID        : IAE={iae_drl:.6e} | ITAE={itae_drl:.6e}")
+        print(f"  PSO-PID        : IAE={iae_pid:.6e} | ITAE={itae_pid:.6e}")
+        print(f"  LQG            : IAE={iae_lqg:.6e} | ITAE={itae_lqg:.6e}")
 
         t = res_un["t"]
+        mask = (t >= plot_range[0]) & (t <= plot_range[1])
+        tp = t[mask] - plot_range[0]
+
+        save_data_to_txt(out_dir, scen_name, tp, res_un, res_drl, res_pid, res_lqg, mask)
+
         save_three_figs(
             out_dir=out_dir,
             scenario_key=scen_name,

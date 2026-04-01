@@ -21,8 +21,8 @@ class Config:
 
     # PID parameter ranges (before normalization)
     KP_RANGE = [0.0, 200.0]
-    KI_RANGE = [0.0, 30.0]
-    KD_RANGE = [20.0, 30.0]
+    KI_RANGE = [0.0, 50.0]
+    KD_RANGE = [27.5, 30.0]
 
     U_LIMIT = 300.0
 
@@ -38,8 +38,8 @@ class Config:
     BATCH_SIZE = 1024
 
     # Reward weights
-    OUTPUT_WEIGHT = 1  # Output Y weight
-    PARAM_PENALTY = 10  # Penalty for parameter changes
+    OUTPUT_WEIGHT = 10  # Output Y weight
+    PARAM_PENALTY = 1  # Penalty for parameter changes
 
     # Device
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

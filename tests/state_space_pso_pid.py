@@ -5,8 +5,9 @@ import multiprocessing as mp
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
+
 # =========================================================
-# State-space simulator (STRICTLY follows your implementation)
+# State-space simulator
 # X'(t) = A X(t) + B u(t) + F(t)
 # Y(t)  = C X(t)
 #
@@ -40,7 +41,7 @@ class StateSpace:
 
         # State/output arrays
         self.X = np.zeros((4, tn))
-        self.Xd = np.zeros((4, tn))   # store Xdot at each step (last step filled at end)
+        self.Xd = np.zeros((4, tn))  # store Xdot at each step (last step filled at end)
         self.Y = np.zeros(tn)
         self.u = 0
 
@@ -77,8 +78,8 @@ class StateSpace:
             [
                 [0, 0, 1, 0],
                 [0, 0, 0, 1],
-                [-w1**2, 0, -2 * z1 * w1, 0],
-                [0, -w2**2, 0, -2 * z2 * w2],
+                [-w1 ** 2, 0, -2 * z1 * w1, 0],
+                [0, -w2 ** 2, 0, -2 * z2 * w2],
             ],
             dtype=float,
         )
@@ -126,7 +127,9 @@ class StateSpace:
             self.ei += (self.e * self.dt)
             self.ed = (self.C @ Xd_col)
 
-            self.u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed
+            # Control calculation with numerical clipping to prevent overflow
+            raw_u = self.kp * self.e - self.ki * self.ei - self.kd * self.ed
+            self.u = np.clip(raw_u, -1e6, 1e6)
             self.u_history[i] = (self.u).item()
 
             # external controller (kept)
@@ -145,8 +148,13 @@ class StateSpace:
             k4_col = self.dt * (self.A @ (X_col + k3_col) + self.B * self.u + F2)
 
             X_update_col = X_col + (k1_col + 2 * k2_col + 2 * k3_col + k4_col) / 6.0
-            self.X[:, i + 1] = X_update_col.reshape(-1)
 
+            # Early stopping divergence protection
+            if np.max(np.abs(X_update_col)) > 1e4:
+                self.X[:, i + 1:] = np.nan
+                break
+
+            self.X[:, i + 1] = X_update_col.reshape(-1)
             Y_next = self.C @ X_update_col
             self.Y[i + 1] = Y_next.item()
 
@@ -202,32 +210,33 @@ _G_CONFIG_SYSTEM = None
 _G_NOISE_LIST = None
 _G_DT = None
 _G_TN = None
-_G_YDOT_W = None
+_G_WEIGHT = None
 _G_FAIL = None
 _G_UCLIP = None
+_G_ENV_WEIGHTS = None
 
 
-def _worker_init(config_system, noise_data_list, dt, tn, ydot_weight, fail_penalty, u_clip):
-    global _G_CONFIG_SYSTEM, _G_NOISE_LIST, _G_DT, _G_TN, _G_YDOT_W, _G_FAIL, _G_UCLIP
+def _worker_init(config_system, noise_data_list, dt, tn, weight, fail_penalty, u_clip, env_weights):
+    global _G_CONFIG_SYSTEM, _G_NOISE_LIST, _G_DT, _G_TN, _G_WEIGHT, _G_FAIL, _G_UCLIP, _G_ENV_WEIGHTS
     _G_CONFIG_SYSTEM = config_system
     _G_NOISE_LIST = noise_data_list
     _G_DT = float(dt)
     _G_TN = int(tn)
-    _G_YDOT_W = float(ydot_weight)
+    _G_WEIGHT = float(weight)
     _G_FAIL = float(fail_penalty)
     _G_UCLIP = u_clip
+    _G_ENV_WEIGHTS = np.array(env_weights, dtype=float)
 
 
 def _eval_one_particle(pid_params):
     """
     Evaluate one particle (kp, ki, kd):
-    objective = mean over 5 envs of integral(y^2 + 10*y'^2) dt
-    where y' = C Xdot = C Xd (STRICTLY from state-space)
+    objective = weighted sum over 6 envs of integral(y^2 + W_ydot*y'^2) dt
     """
     kp, ki, kd = pid_params
     try:
-        vals = []
-        for noise_data in _G_NOISE_LIST:
+        total_weighted_J = 0.0
+        for i, noise_data in enumerate(_G_NOISE_LIST):
             ss = StateSpace(
                 _G_CONFIG_SYSTEM,
                 noise_data,
@@ -257,46 +266,48 @@ def _eval_one_particle(pid_params):
             if (not np.isfinite(y).all()) or (not np.isfinite(ydot).all()):
                 return _G_FAIL
 
-            J_env = _G_DT * float(np.sum(y * y + _G_YDOT_W * (ydot * ydot)))
+            J_env = _G_DT * float(np.sum(y * y + _G_WEIGHT * (ydot * ydot)))
             if (not np.isfinite(J_env)) or (J_env >= _G_FAIL):
                 return _G_FAIL
 
-            vals.append(J_env)
+            total_weighted_J += J_env * _G_ENV_WEIGHTS[i]
 
-        return float(np.mean(vals))
+        return float(total_weighted_J)
     except Exception:
         return _G_FAIL
 
 
 # =========================================================
-# PSO (particle evaluation parallelized by 14 workers)
+# PSO (particle evaluation parallelized by workers)
 # =========================================================
 class PSO_PID:
     def __init__(
-        self,
-        config_system,
-        noise_data_list,   # length=5
-        dt,
-        tn,
-        kp_bounds=(0.0, 170.0),
-        ki_bounds=(0.0, 50.0),
-        kd_bounds=(0.0, 25.0),
-        n_particles=30,
-        n_iters=60,
-        w=0.72,
-        c1=1.49,
-        c2=1.49,
-        seed=42,
-        ydot_weight=10.0,
-        fail_penalty=1e18,
-        u_clip=None,
-        n_workers=14,      # 14 cores parallel
-        mp_start_method=None,  # None -> choose automatically; or "spawn"/"fork"
+            self,
+            config_system,
+            noise_data_list,
+            dt,
+            tn,
+            kp_bounds=(0.0, 170.0),
+            ki_bounds=(0.0, 50.0),
+            kd_bounds=(0.0, 25.0),
+            n_particles=30,
+            n_iters=60,
+            w=0.72,
+            c1=1.49,
+            c2=1.49,
+            seed=42,
+            weight=10,
+            fail_penalty=1e18,
+            u_clip=None,
+            env_weights=None,
+            initial_guess=None,
+            n_workers=14,
+            mp_start_method=None,
     ):
         self.config_system = config_system
         self.noise_data_list = list(noise_data_list)
-        if len(self.noise_data_list) != 5:
-            raise ValueError(f"noise_data_list must have length 5, got {len(self.noise_data_list)}")
+        if len(self.noise_data_list) != 6:
+            raise ValueError(f"noise_data_list must have length 6, got {len(self.noise_data_list)}")
 
         self.dt = float(dt)
         self.tn = int(tn)
@@ -310,17 +321,23 @@ class PSO_PID:
         self.c2 = float(c2)
         self.rng = np.random.default_rng(seed)
 
-        self.ydot_weight = float(ydot_weight)
+        self.weight = float(weight)
         self.fail_penalty = float(fail_penalty)
         self.u_clip = u_clip
+        self.env_weights = env_weights
 
         self.n_workers = int(n_workers)
-        self.mp_start_method = mp_start_method  # allow override
+        self.mp_start_method = mp_start_method
 
         # init positions & velocities
         low = self.bounds[:, 0]
         high = self.bounds[:, 1]
         self.pos = self.rng.uniform(low, high, size=(self.n_particles, 3))
+
+        # Inject warm start if provided to prevent initial global divergence
+        if initial_guess is not None:
+            self.pos[0] = np.array(initial_guess, dtype=float)
+
         vel_scale = 0.1 * (high - low)
         self.vel = self.rng.uniform(-vel_scale, vel_scale, size=(self.n_particles, 3))
 
@@ -338,26 +355,24 @@ class PSO_PID:
         return np.minimum(np.maximum(x, low), high)
 
     def run(self, verbose=True):
-        # choose multiprocessing context
         if self.mp_start_method is None:
-            # "fork" is fastest on Linux, but "spawn" is safer cross-platform.
-            # If you're on Linux and want speed, set mp_start_method="fork".
             ctx = mp.get_context("spawn")
         else:
             ctx = mp.get_context(self.mp_start_method)
 
         with ctx.Pool(
-            processes=self.n_workers,
-            initializer=_worker_init,
-            initargs=(
-                self.config_system,
-                self.noise_data_list,
-                self.dt,
-                self.tn,
-                self.ydot_weight,
-                self.fail_penalty,
-                self.u_clip,
-            ),
+                processes=self.n_workers,
+                initializer=_worker_init,
+                initargs=(
+                        self.config_system,
+                        self.noise_data_list,
+                        self.dt,
+                        self.tn,
+                        self.weight,
+                        self.fail_penalty,
+                        self.u_clip,
+                        self.env_weights,
+                ),
         ) as pool:
 
             for it in range(self.n_iters):
@@ -389,7 +404,7 @@ class PSO_PID:
                 if verbose:
                     bk, bi, bd = self.gbest_pos
                     print(
-                        f"[PSO-14C] iter={it+1:03d}/{self.n_iters}, best J(avg5)={self.gbest_val:.6e}, "
+                        f"[PSO-14C] iter={it + 1:03d}/{self.n_iters}, best Weighted_J={self.gbest_val:.6e}, "
                         f"kp={bk:.6g}, ki={bi:.6g}, kd={bd:.6g}"
                     )
 
@@ -399,7 +414,7 @@ class PSO_PID:
         plt.figure(figsize=(9, 4))
         plt.plot(np.arange(1, len(self.best_history) + 1), self.best_history, linewidth=1.5)
         plt.xlabel("Iteration")
-        plt.ylabel("Best objective J (avg over 5 envs)")
+        plt.ylabel("Best Weighted Objective J (6 envs)")
         plt.title("PSO Convergence")
         plt.grid(True, linestyle=":", alpha=0.7)
         plt.tight_layout()
@@ -410,7 +425,7 @@ class PSO_PID:
 
 
 # =========================================================
-# Main: build 5 disturbance environments -> PSO(14-core) -> validate
+# Main: build 6 disturbance environments -> PSO(14-core) -> validate
 # =========================================================
 if __name__ == "__main__":
     from config.config import Config
@@ -433,9 +448,10 @@ if __name__ == "__main__":
     proj = BeamDisturbanceProjector()
     projector_coeffs = proj.get_static_coeffs()
 
-    # 4) build 5 environments (edit to match your create_noise_data options)
-    env_options = ["impact", "thermal", "jitter", "maneuver", "mixed"]
-    env_seeds = [101, 102, 103, 104, 105]
+    # 4) build 6 environments (edit to match create_noise_data options)
+    env_options = ["impact", "thermal", "jitter", "maneuver", "mixed", "free"]
+    weights = [2e-5, 0.1, 200, 1, 0.1, 1]
+    env_seeds = [101, 102, 103, 104, 105, 106]
 
     noise_data_list = []
     for opt, sd in zip(env_options, env_seeds):
@@ -456,48 +472,53 @@ if __name__ == "__main__":
         dt=dt,
         tn=tn,
         kp_bounds=(0.0, 180.0),
-        ki_bounds=(0.0, 100.0),
+        ki_bounds=(0.0, 300.0),
         kd_bounds=(0.0, 30.0),
         n_particles=30,
         n_iters=60,
         w=0.72,
-        c1=1.49,
-        c2=1.49,
+        c1=1.5,
+        c2=1.5,
         seed=123,
-        ydot_weight=0.1,
+        weight=10,
         fail_penalty=1e18,
         u_clip=None,
+        env_weights=weights,
+        initial_guess=[100.0, 30.0, 20.0],  # PREVENTS INITIAL DIVERGENCE
         n_workers=14,
-        mp_start_method=None,  # None->spawn; if Linux and want speed: "fork"
+        mp_start_method=None,
     )
 
-    print("Running PSO (14-core parallel): objective = mean_{5 env} integral(y^2 + 10 y'^2) dt ...")
+    print("Running PSO (14-core parallel): objective = weighted sum of integral(y^2 + 0.1 y'^2) dt ...")
     best_pid, best_J = pso.run(verbose=True)
     best_kp, best_ki, best_kd = best_pid
 
     print("\n========== PSO RESULT ==========")
-    print(f"Best J(avg5) = {best_J:.6e}")
-    print(f"Best kp      = {best_kp:.10g}")
-    print(f"Best ki      = {best_ki:.10g}")
-    print(f"Best kd      = {best_kd:.10g}")
+    print(f"Best Weighted J = {best_J:.6e}")
+    print(f"Best kp         = {best_kp:.10g}")
+    print(f"Best ki         = {best_ki:.10g}")
+    print(f"Best kd         = {best_kd:.10g}")
     print("================================\n")
 
     pso.plot_convergence(save_path="../../results/pso_convergence.png")
 
-    # 6) Validate best PID on each env and print per-env + mean
-    per_env = []
-    for opt, nd in zip(env_options, noise_data_list):
+    # 6) Validate best PID on each env and print per-env + total weighted
+    weighted_J_total = 0.0
+    for i, (opt, nd) in enumerate(zip(env_options, noise_data_list)):
         ss = StateSpace(config.SYSTEM_CONFIG, nd, dt=dt, tn=tn, kp=best_kp, ki=best_ki, kd=best_kd)
         ss.solve()
 
         C = ss.C.reshape(1, 4)
         y = (C @ ss.X).reshape(-1)
         ydot = (C @ ss.Xd).reshape(-1)
-        J = dt * float(np.sum(y * y + 10.0 * (ydot * ydot)))
-        per_env.append(J)
-        print(f"[VALID] option={opt:<8s}  J_env={J:.6e}")
 
-    print(f"[VALID] mean over 5 envs  J_mean={float(np.mean(per_env)):.6e}")
+        # ALIGNED WITH PSO OBJECTIVE FUNCTION
+        J = dt * float(np.sum(y * y + 0.1 * (ydot * ydot)))
+        weighted_J_total += J * weights[i]
+
+        print(f"[VALID] option={opt:<8s}  J_env={J:.6e}  Weight={weights[i]:.1e}")
+
+    print(f"[VALID] Total Weighted J over 6 envs = {weighted_J_total:.6e}")
 
     # 7) Plot one representative env (e.g., impact) with best PID
     ss_plot = StateSpace(config.SYSTEM_CONFIG, noise_data_list[0], dt=dt, tn=tn, kp=best_kp, ki=best_ki, kd=best_kd)
