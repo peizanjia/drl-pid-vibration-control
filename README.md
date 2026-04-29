@@ -1,7 +1,7 @@
 # DRL-PID Vibration Control of a Spaceborne Flexible Beam
 
 This project is the official implementation of the paper (not published yet)
-"Deep Reinforcement Learning-Based Gain-Scheduled PID Vibration Control of a Spaceborne Flexible Beam".
+"Active Vibration Control of Large Flexible Thin-Walled Tubular Structures Using a Deep Reinforcement Learning-Augmented PID Controller".
 
 ## Overview
 This project trains a DDPG agent to output PID gains for a SISO beam vibration control task.
